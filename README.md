@@ -33,6 +33,7 @@ Planned inline-menu actions:
 - Edit tags on the currently browsed GIF
 - Filter by tag or category
 - Send an existing GIF when a duplicate is detected
+- Ask before saving a GIF sent without a save command; existing GIFs open in browse mode
 - Start backup or restore with a confirmation step
 - Open the native Telegram inline GIF picker
 
@@ -51,6 +52,10 @@ The bot uses local storage inside the container for fast access:
 - Docker volume mounted at `/data`
 
 To survive loss of the Docker volume, `/backup` creates a compressed archive containing the current user's database records and media files. The bot sends that archive as a document directly into the same private chat with that user. No backup channel, group, or other Telegram destination is required. The user can reply to that document with `/restore` after a reinstall or data loss.
+
+The hosted Telegram Bot API limits bot document uploads to 50 MiB. The bot checks the generated archive before uploading and reports its size when the library is too large. The configured 2 GiB GIF limit applies to individual GIFs on local storage; it does not increase Telegram's document upload limit.
+
+Backups larger than 19 MiB are split into numbered parts followed by a small manifest document. The 19 MiB part size supports both Telegram's bot upload and hosted `getFile` download limits. To restore one, reply to the manifest document with `/restore`; the bot downloads and verifies every part, reassembles the archive, and then restores the library.
 
 The bot only needs its bot token to write and read backup documents in the user's private chat. Backups should be treated as sensitive. The bot should reject restore attempts for documents that were not created by the bot or do not belong to the current user.
 

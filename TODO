@@ -23,6 +23,7 @@
 - [x] Implement a save conversation with cancel support
 - [x] Compute a SHA-256 hash before storing a GIF
 - [x] Return the existing GIF when an exact duplicate is detected
+- [x] Ask before saving unsolicited GIFs and browse existing ones
 - [x] Add reply-based `/delete` for saved GIFs
 - [x] Add tag editing from the GIF browser
 - [ ] Add optional tags and categories during saving
