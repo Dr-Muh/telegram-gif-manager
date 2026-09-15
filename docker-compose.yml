@@ -1,11 +1,13 @@
 services:
   telegram-gif-manager:
-    build: .
+    image: telegram-gif-manager:latest
     restart: unless-stopped
-    env_file:
-      - .env
     environment:
+      BOT_TOKEN: ${BOT_TOKEN}
+      ALLOWED_USER_IDS: ${ALLOWED_USER_IDS}
       DATA_DIR: /data
+      MAX_FILE_SIZE: ${MAX_FILE_SIZE:-19922944}
+      TZ: ${TZ:-Europe/Berlin}
     volumes:
       - gif-manager-data:/data
 

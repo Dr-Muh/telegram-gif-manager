@@ -94,3 +94,8 @@ python bot/main.py
 ```
 
 Without Docker, data defaults to `./data` inside the project and can be changed with `DATA_DIR`. Docker overrides this setting and stores data in its persistent `/data` volume. The bot requires a valid token and at least one allowlisted Telegram user ID before it starts polling.
+
+## Build the image for Linux amd64 (telegram-gif-manager.tar already compiled)
+
+docker build --platform linux/amd64 -t telegram-gif-manager .
+docker save -o telegram-gif-manager.tar telegram-gif-manager
