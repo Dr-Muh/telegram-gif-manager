@@ -16,6 +16,8 @@
 - [x] Add `/start` and `/help` with the full command list
 - [ ] Register Telegram command suggestions in BotFather-compatible form
 - [x] Add an inline-keyboard main menu
+- [x] Add a native inline GIF picker using cached Telegram file IDs
+- [ ] Enable inline mode with BotFather during deployment
 - [x] Accept GIFs sent directly and forwarded from another chat
 - [x] Implement a save conversation with cancel support
 - [x] Compute a SHA-256 hash before storing a GIF

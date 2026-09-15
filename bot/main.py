@@ -5,11 +5,14 @@ import re
 import sys
 from collections import deque
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaAnimation, Update
+from telegram import (
+    InlineKeyboardButton, InlineKeyboardMarkup, InlineQueryResultCachedGif,
+    InputMediaAnimation, Update,
+)
 from telegram.constants import ChatAction
 from telegram.ext import (
     Application, CallbackQueryHandler, CommandHandler, ContextTypes,
-    MessageHandler, filters,
+    InlineQueryHandler, MessageHandler, filters,
 )
 
 if __package__:
@@ -43,6 +46,7 @@ def menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("Save GIF", callback_data="save"), InlineKeyboardButton("Browse", callback_data="list")],
         [InlineKeyboardButton("Random GIF", callback_data="random"), InlineKeyboardButton("Backup", callback_data="backup")],
+        [InlineKeyboardButton("Use inline picker", switch_inline_query_current_chat="")],
     ])
 
 
@@ -100,6 +104,27 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/cancel - cancel saving\n/help - show this menu",
         reply_markup=menu(),
     )
+
+
+async def inline_gifs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    config: Config = context.application.bot_data["config"]
+    user = update.inline_query.from_user
+    if user.id not in config.allowed_user_ids:
+        await update.inline_query.answer([], cache_time=0, is_personal=True)
+        return
+    query = update.inline_query.query.strip().casefold()
+    records = context.application.bot_data["database"].list_gifs(user.id)
+    if query:
+        records = [record for record in records if query in record["tags"].casefold()]
+    results = [
+        InlineQueryResultCachedGif(
+            id=f"gif-{record['id']}",
+            gif_file_id=record["file_id"],
+            title=f"GIF {index + 1}",
+        )
+        for index, record in enumerate(records)
+    ]
+    await update.inline_query.answer(results, cache_time=0, is_personal=True)
 
 
 async def save_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -280,6 +305,7 @@ def build_application(config: Config) -> Application:
     application.add_handler(CommandHandler("list", list_gifs))
     application.add_handler(CommandHandler("backup", backup))
     application.add_handler(CommandHandler("restore", restore))
+    application.add_handler(InlineQueryHandler(inline_gifs))
     application.add_handler(CallbackQueryHandler(button, pattern="^(save|list|backup|random|menu|browse:.*)$"))
     return application
 

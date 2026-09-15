@@ -31,6 +31,13 @@ Planned inline-menu actions:
 - Filter by tag or category
 - Send an existing GIF when a duplicate is detected
 - Start backup or restore with a confirmation step
+- Open the native Telegram inline GIF picker
+
+## Inline GIF picker
+
+Enable inline mode once in BotFather with `/setinline` for this bot. Users can then press **Use inline picker** in the menu or type `@your_bot` in any chat. The bot returns `InlineQueryResultCachedGif` results using the Telegram `file_id`s already stored for that user, so Telegram renders the results in its native inline grid and no media is downloaded again.
+
+Inline results are private to the requesting allowlisted user. An empty inline query shows that user's saved GIFs; typing a search term currently filters by saved tags. Inline mode does not expose another user's library.
 
 ## Persistence and recovery
 
@@ -67,7 +74,7 @@ The bot should validate backup archives before replacing local data and keep the
 
 Initial implementation is available. Copy `.env.example` to `.env`, set the bot token and one or more Telegram user IDs in `ALLOWED_USER_IDS`, then run `docker compose up --build`.
 
-The bot currently implements the allowlist, help/menu, single-GIF saving, exact deduplication, per-user local storage, manual `/backup`, and reply-based `/restore`. Browse, search, tagging, and random retrieval remain on the TODO list.
+The bot currently implements the allowlist, help/menu, single-GIF saving, exact deduplication, per-user local storage, manual `/backup`, reply-based `/restore`, and the inline GIF picker. Search, tagging, and random retrieval remain on the TODO list.
 
 ## Run without Docker
 
