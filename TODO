@@ -1,0 +1,65 @@
+# MVP TODO
+
+## Product decisions
+
+- [x] Python bot
+- [x] Docker deployment
+- [x] Local storage for normal operation
+- [x] The user's private bot chat as an off-container backup store
+- [x] Single-GIF saving only
+- [x] No Telegram user credentials
+- [ ] Decide whether the bot is private to one owner or shared with an allowlist
+- [ ] Decide default backup interval and retention count
+
+## Bot behavior
+
+- [ ] Add `/start` and `/help` with the full command list
+- [ ] Register Telegram command suggestions in BotFather-compatible form
+- [ ] Add an inline-keyboard main menu
+- [ ] Accept GIFs sent directly and forwarded from another chat
+- [ ] Implement a save conversation with cancel support
+- [ ] Compute a SHA-256 hash before storing a GIF
+- [ ] Return the existing GIF when an exact duplicate is detected
+- [ ] Add optional tags and categories during saving
+- [ ] Implement paginated browsing with inline buttons
+- [ ] Implement tag search and random GIF retrieval
+- [ ] Handle unsupported media and large files clearly
+
+## Persistence
+
+- [ ] Define SQLite schema for GIFs, hashes, tags, and backup records
+- [ ] Store media and database below `/data`
+- [ ] Create atomic local writes and startup integrity checks
+- [ ] Build a versioned compressed backup archive
+- [ ] Make `/backup` send the current user's archive to the current bot chat
+- [ ] Validate backup checksum and archive contents before restore
+- [ ] Accept `/restore` only as a reply to a bot-created backup document
+- [ ] Validate checksum, ownership, and archive contents before restore
+- [ ] Keep existing data untouched if restore validation fails
+- [ ] Add confirmed manual `/backup` and reply-based `/restore` actions
+- [ ] Add periodic backups and configurable retention
+
+## Docker and operations
+
+- [ ] Add `Dockerfile`
+- [ ] Add `docker-compose.yml` with a `/data` volume
+- [ ] Add `.env.example` with `BOT_TOKEN` and storage settings
+- [ ] Add health logging and graceful shutdown
+- [ ] Document private bot-chat backup and restore setup
+- [ ] Document backup security and recovery procedure
+
+## Testing
+
+- [ ] Test hash-based duplicate detection
+- [ ] Test backup creation and checksum validation
+- [ ] Test restore into an empty data directory
+- [ ] Test failed restore leaves existing data untouched
+- [ ] Test command handlers and inline keyboard callbacks
+- [ ] Test the Docker image with a mounted volume
+
+## Later, explicitly out of scope
+
+- [ ] Bulk import of historical chat GIFs
+- [ ] Telethon or another Telegram user-account client
+- [ ] Approximate duplicate detection
+- [ ] Cloud storage
