@@ -30,6 +30,7 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 MAX_PROCESSED_CALLBACKS = 1000
+MAX_INLINE_RESULTS = 50
 
 
 def allowed(update: Update, config: Config) -> bool:
@@ -40,6 +41,10 @@ def allowed(update: Update, config: Config) -> bool:
 async def deny(update: Update) -> None:
     if update.effective_message:
         await update.effective_message.reply_text("This bot is private and your account is not allowlisted.")
+
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.error("Unhandled update error", exc_info=context.error)
 
 
 def menu() -> InlineKeyboardMarkup:
@@ -162,6 +167,7 @@ async def inline_gifs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     records = context.application.bot_data["database"].list_gifs(user.id)
     if query:
         records = [record for record in records if query in record["tags"].casefold()]
+    records = records[:MAX_INLINE_RESULTS]
     results = [
         InlineQueryResultCachedGif(
             id=f"gif-{record['id']}",
@@ -460,6 +466,7 @@ def build_application(config: Config) -> Application:
     application.add_handler(CommandHandler("restore", restore))
     application.add_handler(InlineQueryHandler(inline_gifs))
     application.add_handler(CallbackQueryHandler(button, pattern="^(save|bulk_save|list|backup|random|menu|browse:.*|edit_tags:.*|tag:.*|tags_done:.*)$"))
+    application.add_error_handler(error_handler)
     return application
 
 
