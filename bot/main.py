@@ -91,11 +91,20 @@ async def show_browsed_gif(
             media=InputMediaAnimation(media=record["file_id"], caption=caption),
             reply_markup=browse_menu(index, len(records), record["id"]),
         )
+    elif context.user_data.get("browse_message_id"):
+        await context.bot.edit_message_media(
+            chat_id=context.user_data["browse_chat_id"],
+            message_id=context.user_data["browse_message_id"],
+            media=InputMediaAnimation(media=record["file_id"], caption=caption),
+            reply_markup=browse_menu(index, len(records), record["id"]),
+        )
     else:
-        await update.effective_message.reply_animation(
+            sent_message = await update.effective_message.reply_animation(
             record["file_id"], caption=caption,
             reply_markup=browse_menu(index, len(records), record["id"]),
         )
+            context.user_data["browse_chat_id"] = sent_message.chat_id
+            context.user_data["browse_message_id"] = sent_message.message_id
 
 
 def tag_menu(gif_id: int, current_tags: str, available_tags: list[str]) -> InlineKeyboardMarkup:
@@ -311,14 +320,18 @@ async def list_gifs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     record = records[0]
     caption = browse_caption(0, len(records), record)
     if update.callback_query:
+        context.user_data["browse_chat_id"] = update.callback_query.message.chat_id
+        context.user_data["browse_message_id"] = update.callback_query.message.message_id
         await update.callback_query.edit_message_media(
             media=InputMediaAnimation(media=record["file_id"], caption=caption),
             reply_markup=browse_menu(0, len(records), record["id"]),
         )
     else:
-        await update.effective_message.reply_animation(
+        sent_message = await update.effective_message.reply_animation(
             record["file_id"], caption=caption, reply_markup=browse_menu(0, len(records), record["id"])
         )
+        context.user_data["browse_chat_id"] = sent_message.chat_id
+        context.user_data["browse_message_id"] = sent_message.message_id
 
 
 async def browse_gif(update: Update, context: ContextTypes.DEFAULT_TYPE, index: int) -> None:
@@ -408,8 +421,10 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             return
         available_tags = context.application.bot_data["database"].list_tags(update.effective_user.id)
         context.user_data["editing_gif_id"] = gif_id
-        await query.message.reply_text(
-            "Choose tags to add or remove -- or type a comma seperated list of tags:",
+        context.user_data["browse_chat_id"] = query.message.chat_id
+        context.user_data["browse_message_id"] = query.message.message_id
+        await query.edit_message_caption(
+            caption="Choose tags to add or remove -- or type a comma separated list of tags:",
             reply_markup=tag_menu(gif_id, record["tags"], available_tags),
         )
     elif query.data.startswith("tag:"):
