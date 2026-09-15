@@ -14,6 +14,7 @@
 ## Bot behavior
 
 - [x] Add `/start` and `/help` with the full command list
+- [x] Add `/bulk_save` mode that continues until `/cancel` or another command
 - [ ] Register Telegram command suggestions in BotFather-compatible form
 - [x] Add an inline-keyboard main menu
 - [x] Add a native inline GIF picker using cached Telegram file IDs

@@ -45,6 +45,7 @@ async def deny(update: Update) -> None:
 def menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("Save GIF", callback_data="save"), InlineKeyboardButton("Browse", callback_data="list")],
+        [InlineKeyboardButton("Bulk save", callback_data="bulk_save")],
         [InlineKeyboardButton("Random GIF", callback_data="random"), InlineKeyboardButton("Backup", callback_data="backup")],
         [InlineKeyboardButton("Use inline picker", switch_inline_query_current_chat="")],
     ])
@@ -97,9 +98,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     config: Config = context.application.bot_data["config"]
     if not allowed(update, config):
         return await deny(update)
+    context.user_data.pop("save_mode", None)
     await update.effective_message.reply_text(
         "Telegram GIF Manager\n\n"
         "/save - save the next GIF\n/list - browse your GIFs\n/random - get a random GIF\n"
+        "/bulk_save - save GIFs until /cancel or another command\n"
         "/backup - back up your data here\n/restore - reply to a bot backup with this command\n"
         "/cancel - cancel saving\n/help - show this menu",
         reply_markup=menu(),
@@ -134,16 +137,28 @@ async def save_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not allowed(update, config):
         await deny(update)
         return None
-    context.user_data["awaiting_gif"] = True
+    context.user_data["save_mode"] = "single"
     await update.effective_message.reply_text("Send one GIF now. Use /cancel to stop.")
     return None
+
+
+async def bulk_save_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not claim_update(update, context):
+        return
+    config: Config = context.application.bot_data["config"]
+    if not allowed(update, config):
+        await deny(update)
+        return
+    context.user_data["save_mode"] = "bulk"
+    await update.effective_message.reply_text("Send GIFs now. I will keep saving them until /cancel or another command.")
 
 
 async def receive_gif(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not claim_update(update, context):
         return
     config: Config = context.application.bot_data["config"]
-    if not context.user_data.get("awaiting_gif"):
+    save_mode = context.user_data.get("save_mode")
+    if not save_mode:
         return None
     if not allowed(update, config):
         await deny(update)
@@ -168,21 +183,25 @@ async def receive_gif(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     existing = database.find_by_hash(user_id, digest)
     if existing:
         temporary_path.unlink(missing_ok=True)
-        context.user_data.pop("awaiting_gif", None)
+        if save_mode == "single":
+            context.user_data.pop("save_mode", None)
         await message.reply_animation(existing["file_id"], caption="Already saved: this GIF is a duplicate.")
         return None
     destination = user_dir / f"{digest}.gif"
     temporary_path.replace(destination)
     database.add_gif(user_id, digest, str(destination.relative_to(data_dir)), media.file_id)
-    context.user_data.pop("awaiting_gif", None)
-    await message.reply_text("GIF saved.")
+    if save_mode == "single":
+        context.user_data.pop("save_mode", None)
+        await message.reply_text("GIF saved.")
+    else:
+        await message.reply_text("GIF saved. Send another GIF or /cancel.")
     return None
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not claim_update(update, context):
         return
-    context.user_data.pop("awaiting_gif", None)
+    context.user_data.pop("save_mode", None)
     if update.effective_message:
         await update.effective_message.reply_text("Cancelled.")
     return None
@@ -194,6 +213,7 @@ async def list_gifs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     config: Config = context.application.bot_data["config"]
     if not allowed(update, config):
         return await deny(update)
+    context.user_data.pop("save_mode", None)
     records = context.application.bot_data["database"].list_gifs(update.effective_user.id)
     if not records:
         await update.effective_message.reply_text("You have no saved GIFs yet.", reply_markup=menu())
@@ -234,6 +254,7 @@ async def backup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     config: Config = context.application.bot_data["config"]
     if not allowed(update, config):
         return await deny(update)
+        context.user_data.pop("save_mode", None)
     archive, digest = create_backup(context.application.bot_data["database"], config.data_dir, update.effective_user.id)
     try:
         with archive.open("rb") as backup_file:
@@ -248,6 +269,7 @@ async def restore(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     config: Config = context.application.bot_data["config"]
     if not allowed(update, config):
         return await deny(update)
+        context.user_data.pop("save_mode", None)
     reply = update.effective_message.reply_to_message
     if not reply or not reply.document or not reply.caption or not reply.caption.startswith("GIF Manager backup"):
         await update.effective_message.reply_text("Reply to a bot-created backup document with /restore.")
@@ -279,8 +301,11 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     await query.answer()
     if query.data == "save":
-        context.user_data["awaiting_gif"] = True
+        context.user_data["save_mode"] = "single"
         await query.message.reply_text("Send one GIF now. Use /cancel to stop.")
+    elif query.data == "bulk_save":
+        context.user_data["save_mode"] = "bulk"
+        await query.message.reply_text("Send GIFs now. I will keep saving them until /cancel or another command.")
     elif query.data.startswith("browse:"):
         if query.data != "browse:noop":
             await browse_gif(update, context, int(query.data.split(":", 1)[1]))
@@ -300,13 +325,14 @@ def build_application(config: Config) -> Application:
     application.bot_data["database"] = Database(config.data_dir / "gifs.db")
     application.add_handler(CommandHandler(["start", "help"], start))
     application.add_handler(CommandHandler("save", save_command))
+    application.add_handler(CommandHandler("bulk_save", bulk_save_command))
     application.add_handler(CommandHandler("cancel", cancel))
     application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, receive_gif))
     application.add_handler(CommandHandler("list", list_gifs))
     application.add_handler(CommandHandler("backup", backup))
     application.add_handler(CommandHandler("restore", restore))
     application.add_handler(InlineQueryHandler(inline_gifs))
-    application.add_handler(CallbackQueryHandler(button, pattern="^(save|list|backup|random|menu|browse:.*)$"))
+    application.add_handler(CallbackQueryHandler(button, pattern="^(save|bulk_save|list|backup|random|menu|browse:.*)$"))
     return application
 
 

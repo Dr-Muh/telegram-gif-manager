@@ -15,6 +15,7 @@ The first version intentionally handles one GIF at a time. It does not scan chat
 Planned commands:
 
 - `/save` - save the next GIF sent to the bot
+- `/bulk_save` - save GIFs until `/cancel` or another command
 - `/list` - browse saved GIFs
 - `/search <term>` - find GIFs by tag or category
 - `/tags` - browse and manage tags
@@ -74,7 +75,7 @@ The bot should validate backup archives before replacing local data and keep the
 
 Initial implementation is available. Copy `.env.example` to `.env`, set the bot token and one or more Telegram user IDs in `ALLOWED_USER_IDS`, then run `docker compose up --build`.
 
-The bot currently implements the allowlist, help/menu, single-GIF saving, exact deduplication, per-user local storage, manual `/backup`, reply-based `/restore`, and the inline GIF picker. Search, tagging, and random retrieval remain on the TODO list.
+The bot currently implements the allowlist, help/menu, single-GIF saving, bulk saving until cancellation, exact deduplication, per-user local storage, manual `/backup`, reply-based `/restore`, and the inline GIF picker. Search, tagging, and random retrieval remain on the TODO list.
 
 ## Run without Docker
 
