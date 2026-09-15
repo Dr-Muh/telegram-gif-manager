@@ -51,7 +51,7 @@ def menu() -> InlineKeyboardMarkup:
     ])
 
 
-def browse_menu(index: int, total: int) -> InlineKeyboardMarkup:
+def browse_menu(index: int, total: int, gif_id: int) -> InlineKeyboardMarkup:
     previous_index = (index - 1) % total
     next_index = (index + 1) % total
     return InlineKeyboardMarkup([
@@ -60,8 +60,28 @@ def browse_menu(index: int, total: int) -> InlineKeyboardMarkup:
             InlineKeyboardButton(f"{index + 1} / {total}", callback_data="browse:noop"),
             InlineKeyboardButton("Next", callback_data=f"browse:{next_index}"),
         ],
+        [InlineKeyboardButton("Edit tags", callback_data=f"edit_tags:{gif_id}")],
         [InlineKeyboardButton("Back to menu", callback_data="menu")],
     ])
+
+
+def browse_caption(index: int, total: int, record: object) -> str:
+    tags = record["tags"] or "none"
+    return f"GIF {index + 1} / {total}\nTags: {tags}\nSHA-256: {record['sha256'][:12]}..."
+
+
+def tag_menu(gif_id: int, current_tags: str, available_tags: list[str]) -> InlineKeyboardMarkup:
+    selected = {tag.strip().casefold() for tag in current_tags.split(",") if tag.strip()}
+    buttons = [
+        InlineKeyboardButton(
+            f"{'[x]' if tag.casefold() in selected else '[ ]'} {tag}",
+            callback_data=f"tag:{gif_id}:{index}",
+        )
+        for index, tag in enumerate(available_tags)
+    ]
+    rows = [buttons[index:index + 2] for index in range(0, len(buttons), 2)]
+    rows.append([InlineKeyboardButton("Done", callback_data=f"tags_done:{gif_id}")])
+    return InlineKeyboardMarkup(rows)
 
 
 def claim_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -104,7 +124,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/save - save the next GIF\n/list - browse your GIFs\n/random - get a random GIF\n"
         "/bulk_save - save GIFs until /cancel or another command\n"
         "/backup - back up your data here\n/restore - reply to a bot backup with this command\n"
-        "/cancel - cancel saving\n/help - show this menu",
+        "/cancel - cancel saving\n/delete - reply to a saved GIF to delete it\n/help - show this menu",
         reply_markup=menu(),
     )
 
@@ -198,6 +218,47 @@ async def receive_gif(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     return None
 
 
+async def receive_tags(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not claim_update(update, context):
+        return
+    config: Config = context.application.bot_data["config"]
+    if not allowed(update, config) or "editing_gif_id" not in context.user_data:
+        return
+    tags = ", ".join(
+        tag.strip() for tag in update.effective_message.text.split(",") if tag.strip()
+    )
+    if tags == "-":
+        tags = ""
+    if len(tags) > 500:
+        await update.effective_message.reply_text("Those tags are too long. Please try again (maximum 500 characters).")
+        return
+    gif_id = context.user_data.pop("editing_gif_id")
+    context.application.bot_data["database"].update_tags(update.effective_user.id, gif_id, tags)
+    await update.effective_message.reply_text(f"Tags updated: {tags or 'none'}")
+
+
+async def delete_gif(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not claim_update(update, context):
+        return
+    config: Config = context.application.bot_data["config"]
+    if not allowed(update, config):
+        return await deny(update)
+    reply = update.effective_message.reply_to_message
+    media = reply.animation if reply else None
+    if not reply or not reply.from_user or not reply.from_user.is_bot or not media:
+        await update.effective_message.reply_text("Reply to a GIF sent by this bot with /delete.")
+        return
+    database: Database = context.application.bot_data["database"]
+    record = database.find_by_file_id(update.effective_user.id, media.file_id)
+    if not record:
+        await update.effective_message.reply_text("That GIF is not in your saved library.")
+        return
+    file_path = config.data_dir / record["file_path"]
+    database.delete_gif(update.effective_user.id, record["id"])
+    file_path.unlink(missing_ok=True)
+    await update.effective_message.reply_text("GIF deleted.")
+
+
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not claim_update(update, context):
         return
@@ -219,15 +280,15 @@ async def list_gifs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.effective_message.reply_text("You have no saved GIFs yet.", reply_markup=menu())
         return
     record = records[0]
-    caption = f"GIF 1 / {len(records)}\nSHA-256: {record['sha256'][:12]}..."
+    caption = browse_caption(0, len(records), record)
     if update.callback_query:
         await update.callback_query.edit_message_media(
             media=InputMediaAnimation(media=record["file_id"], caption=caption),
-            reply_markup=browse_menu(0, len(records)),
+            reply_markup=browse_menu(0, len(records), record["id"]),
         )
     else:
         await update.effective_message.reply_animation(
-            record["file_id"], caption=caption, reply_markup=browse_menu(0, len(records))
+            record["file_id"], caption=caption, reply_markup=browse_menu(0, len(records), record["id"])
         )
 
 
@@ -242,9 +303,9 @@ async def browse_gif(update: Update, context: ContextTypes.DEFAULT_TYPE, index: 
     await query.edit_message_media(
         media=InputMediaAnimation(
             media=record["file_id"],
-            caption=f"GIF {index + 1} / {len(records)}\nSHA-256: {record['sha256'][:12]}...",
+            caption=browse_caption(index, len(records), record),
         ),
-        reply_markup=browse_menu(index, len(records)),
+        reply_markup=browse_menu(index, len(records), record["id"]),
     )
 
 
@@ -299,6 +360,10 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     if not claim_callback(update, context):
         return
+    config: Config = context.application.bot_data["config"]
+    if not allowed(update, config):
+        await query.answer("Not allowlisted", show_alert=True)
+        return
     await query.answer()
     if query.data == "save":
         context.user_data["save_mode"] = "single"
@@ -306,6 +371,42 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     elif query.data == "bulk_save":
         context.user_data["save_mode"] = "bulk"
         await query.message.reply_text("Send GIFs now. I will keep saving them until /cancel or another command.")
+    elif query.data.startswith("edit_tags:"):
+        gif_id = int(query.data.split(":", 1)[1])
+        record = context.application.bot_data["database"].find_by_id(update.effective_user.id, gif_id)
+        if not record:
+            await query.message.reply_text("That GIF is no longer in your library.")
+            return
+        available_tags = context.application.bot_data["database"].list_tags(update.effective_user.id)
+        context.user_data["editing_gif_id"] = gif_id
+        await query.message.reply_text(
+            "Choose tags to add or remove -- or type a comma seperated list of tags:",
+            reply_markup=tag_menu(gif_id, record["tags"], available_tags),
+        )
+    elif query.data.startswith("tag:"):
+        _, gif_id_text, tag_index_text = query.data.split(":")
+        gif_id = int(gif_id_text)
+        available_tags = context.application.bot_data["database"].list_tags(update.effective_user.id)
+        tag_index = int(tag_index_text)
+        if tag_index >= len(available_tags):
+            await query.answer("That tag is no longer available.", show_alert=True)
+            return
+        record = context.application.bot_data["database"].find_by_id(update.effective_user.id, gif_id)
+        if not record:
+            await query.message.edit_text("That GIF is no longer in your library.")
+            return
+        tags = [tag.strip() for tag in record["tags"].split(",") if tag.strip()]
+        matching_tag = available_tags[tag_index]
+        if matching_tag.casefold() in {tag.casefold() for tag in tags}:
+            tags = [tag for tag in tags if tag.casefold() != matching_tag.casefold()]
+        else:
+            tags.append(matching_tag)
+        updated_tags = ", ".join(tags)
+        context.application.bot_data["database"].update_tags(update.effective_user.id, gif_id, updated_tags)
+        await query.edit_message_reply_markup(reply_markup=tag_menu(gif_id, updated_tags, available_tags))
+    elif query.data.startswith("tags_done:"):
+        context.user_data.pop("editing_gif_id", None)
+        await query.edit_message_text("Tags updated.")
     elif query.data.startswith("browse:"):
         if query.data != "browse:noop":
             await browse_gif(update, context, int(query.data.split(":", 1)[1]))
@@ -327,12 +428,14 @@ def build_application(config: Config) -> Application:
     application.add_handler(CommandHandler("save", save_command))
     application.add_handler(CommandHandler("bulk_save", bulk_save_command))
     application.add_handler(CommandHandler("cancel", cancel))
+    application.add_handler(CommandHandler("delete", delete_gif))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, receive_tags))
     application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, receive_gif))
     application.add_handler(CommandHandler("list", list_gifs))
     application.add_handler(CommandHandler("backup", backup))
     application.add_handler(CommandHandler("restore", restore))
     application.add_handler(InlineQueryHandler(inline_gifs))
-    application.add_handler(CallbackQueryHandler(button, pattern="^(save|bulk_save|list|backup|random|menu|browse:.*)$"))
+    application.add_handler(CallbackQueryHandler(button, pattern="^(save|bulk_save|list|backup|random|menu|browse:.*|edit_tags:.*|tag:.*|tags_done:.*)$"))
     return application
 
 

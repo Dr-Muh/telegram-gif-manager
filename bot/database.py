@@ -42,6 +42,34 @@ class Database:
             "SELECT * FROM gifs WHERE user_id = ? ORDER BY created_at DESC, id DESC", (user_id,)
         ))
 
+    def find_by_id(self, user_id: int, gif_id: int) -> sqlite3.Row | None:
+        return self.connection.execute(
+            "SELECT * FROM gifs WHERE user_id = ? AND id = ?", (user_id, gif_id)
+        ).fetchone()
+
+    def find_by_file_id(self, user_id: int, file_id: str) -> sqlite3.Row | None:
+        return self.connection.execute(
+            "SELECT * FROM gifs WHERE user_id = ? AND file_id = ?", (user_id, file_id)
+        ).fetchone()
+
+    def update_tags(self, user_id: int, gif_id: int, tags: str) -> None:
+        self.connection.execute(
+            "UPDATE gifs SET tags = ? WHERE user_id = ? AND id = ?", (tags, user_id, gif_id)
+        )
+        self.connection.commit()
+
+    def list_tags(self, user_id: int) -> list[str]:
+        tags: set[str] = set()
+        for record in self.list_gifs(user_id):
+            tags.update(tag.strip() for tag in record["tags"].split(",") if tag.strip())
+        return sorted(tags, key=str.casefold)
+
+    def delete_gif(self, user_id: int, gif_id: int) -> None:
+        self.connection.execute(
+            "DELETE FROM gifs WHERE user_id = ? AND id = ?", (user_id, gif_id)
+        )
+        self.connection.commit()
+
     def replace_user_data(self, user_id: int, records: Iterable[dict[str, object]]) -> None:
         self.connection.execute("DELETE FROM gifs WHERE user_id = ?", (user_id,))
         self.connection.executemany(

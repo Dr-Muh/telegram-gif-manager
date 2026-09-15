@@ -16,6 +16,7 @@ Planned commands:
 
 - `/save` - save the next GIF sent to the bot
 - `/bulk_save` - save GIFs until `/cancel` or another command
+- `/delete` - reply to a saved GIF with this command to delete it
 - `/list` - browse saved GIFs
 - `/search <term>` - find GIFs by tag or category
 - `/tags` - browse and manage tags
@@ -29,6 +30,7 @@ Planned inline-menu actions:
 
 - Save a GIF, add tags, and finish saving
 - Browse previous or next GIF
+- Edit tags on the currently browsed GIF
 - Filter by tag or category
 - Send an existing GIF when a duplicate is detected
 - Start backup or restore with a confirmation step
