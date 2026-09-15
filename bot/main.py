@@ -70,6 +70,29 @@ def browse_caption(index: int, total: int, record: object) -> str:
     return f"GIF {index + 1} / {total}\nTags: {tags}\nSHA-256: {record['sha256'][:12]}..."
 
 
+async def show_browsed_gif(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, gif_id: int, edit: bool = False
+) -> None:
+    user_id = update.effective_user.id
+    records = context.application.bot_data["database"].list_gifs(user_id)
+    index = next((index for index, record in enumerate(records) if record["id"] == gif_id), None)
+    if index is None:
+        await update.effective_message.reply_text("That GIF is no longer in your library.")
+        return
+    record = records[index]
+    caption = browse_caption(index, len(records), record)
+    if edit:
+        await update.callback_query.edit_message_media(
+            media=InputMediaAnimation(media=record["file_id"], caption=caption),
+            reply_markup=browse_menu(index, len(records), record["id"]),
+        )
+    else:
+        await update.effective_message.reply_animation(
+            record["file_id"], caption=caption,
+            reply_markup=browse_menu(index, len(records), record["id"]),
+        )
+
+
 def tag_menu(gif_id: int, current_tags: str, available_tags: list[str]) -> InlineKeyboardMarkup:
     selected = {tag.strip().casefold() for tag in current_tags.split(",") if tag.strip()}
     buttons = [
@@ -234,7 +257,7 @@ async def receive_tags(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
     gif_id = context.user_data.pop("editing_gif_id")
     context.application.bot_data["database"].update_tags(update.effective_user.id, gif_id, tags)
-    await update.effective_message.reply_text(f"Tags updated: {tags or 'none'}")
+    await show_browsed_gif(update, context, gif_id)
 
 
 async def delete_gif(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -405,8 +428,9 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         context.application.bot_data["database"].update_tags(update.effective_user.id, gif_id, updated_tags)
         await query.edit_message_reply_markup(reply_markup=tag_menu(gif_id, updated_tags, available_tags))
     elif query.data.startswith("tags_done:"):
+        gif_id = int(query.data.split(":", 1)[1])
         context.user_data.pop("editing_gif_id", None)
-        await query.edit_message_text("Tags updated.")
+        await show_browsed_gif(update, context, gif_id, edit=True)
     elif query.data.startswith("browse:"):
         if query.data != "browse:noop":
             await browse_gif(update, context, int(query.data.split(":", 1)[1]))
