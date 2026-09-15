@@ -1,0 +1,11 @@
+services:
+  telegram-gif-manager:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - gif-manager-data:/data
+
+volumes:
+  gif-manager-data:

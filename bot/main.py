@@ -1,0 +1,190 @@
+import hashlib
+import logging
+from pathlib import Path
+import re
+
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.constants import ChatAction
+from telegram.ext import (
+    Application, CallbackQueryHandler, CommandHandler, ContextTypes,
+    ConversationHandler, MessageHandler, filters,
+)
+
+from .backup import create_backup, restore_backup
+from .config import Config
+from .database import Database
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger(__name__)
+WAITING_FOR_GIF = 1
+
+
+def allowed(update: Update, config: Config) -> bool:
+    user = update.effective_user
+    return user is not None and user.id in config.allowed_user_ids
+
+
+async def deny(update: Update) -> None:
+    if update.effective_message:
+        await update.effective_message.reply_text("This bot is private and your account is not allowlisted.")
+
+
+def menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Save GIF", callback_data="save"), InlineKeyboardButton("Browse", callback_data="list")],
+        [InlineKeyboardButton("Random GIF", callback_data="random"), InlineKeyboardButton("Backup", callback_data="backup")],
+    ])
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    config: Config = context.application.bot_data["config"]
+    if not allowed(update, config):
+        return await deny(update)
+    await update.effective_message.reply_text(
+        "Telegram GIF Manager\n\n"
+        "/save - save the next GIF\n/list - browse your GIFs\n/random - get a random GIF\n"
+        "/backup - back up your data here\n/restore - reply to a bot backup with this command\n"
+        "/cancel - cancel saving\n/help - show this menu",
+        reply_markup=menu(),
+    )
+
+
+async def save_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    config: Config = context.application.bot_data["config"]
+    if not allowed(update, config):
+        await deny(update)
+        return ConversationHandler.END
+    await update.effective_message.reply_text("Send one GIF now. Use /cancel to stop.")
+    return WAITING_FOR_GIF
+
+
+async def receive_gif(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    config: Config = context.application.bot_data["config"]
+    if not allowed(update, config):
+        await deny(update)
+        return ConversationHandler.END
+    message = update.effective_message
+    media = message.animation or (message.document if message.document and message.document.mime_type == "image/gif" else None)
+    if media is None:
+        await message.reply_text("Please send a GIF animation or a GIF document, or use /cancel.")
+        return WAITING_FOR_GIF
+    if media.file_size and media.file_size > config.max_file_size:
+        await message.reply_text("That GIF is larger than the configured file-size limit.")
+        return WAITING_FOR_GIF
+    user_id = update.effective_user.id
+    data_dir: Path = config.data_dir
+    user_dir = data_dir / "gifs" / str(user_id)
+    user_dir.mkdir(parents=True, exist_ok=True)
+    telegram_file = await media.get_file()
+    temporary_path = user_dir / f".{media.file_unique_id}.part"
+    await telegram_file.download_to_drive(temporary_path)
+    digest = hashlib.sha256(temporary_path.read_bytes()).hexdigest()
+    database: Database = context.application.bot_data["database"]
+    existing = database.find_by_hash(user_id, digest)
+    if existing:
+        temporary_path.unlink(missing_ok=True)
+        await message.reply_animation(existing["file_id"], caption="Already saved: this GIF is a duplicate.")
+        return ConversationHandler.END
+    destination = user_dir / f"{digest}.gif"
+    temporary_path.replace(destination)
+    database.add_gif(user_id, digest, str(destination.relative_to(data_dir)), media.file_id)
+    await message.reply_text("GIF saved.")
+    return ConversationHandler.END
+
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if update.effective_message:
+        await update.effective_message.reply_text("Cancelled.")
+    return ConversationHandler.END
+
+
+async def list_gifs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    config: Config = context.application.bot_data["config"]
+    if not allowed(update, config):
+        return await deny(update)
+    records = context.application.bot_data["database"].list_gifs(update.effective_user.id)
+    await update.effective_message.reply_text(f"You have {len(records)} saved GIF(s).", reply_markup=menu())
+
+
+async def backup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    config: Config = context.application.bot_data["config"]
+    if not allowed(update, config):
+        return await deny(update)
+    archive, digest = create_backup(context.application.bot_data["database"], config.data_dir, update.effective_user.id)
+    try:
+        with archive.open("rb") as backup_file:
+            await update.effective_message.reply_document(backup_file, filename=archive.name, caption=f"GIF Manager backup | user:{update.effective_user.id} | sha256:{digest}")
+    finally:
+        archive.unlink(missing_ok=True)
+
+
+async def restore(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    config: Config = context.application.bot_data["config"]
+    if not allowed(update, config):
+        return await deny(update)
+    reply = update.effective_message.reply_to_message
+    if not reply or not reply.document or not reply.caption or not reply.caption.startswith("GIF Manager backup"):
+        await update.effective_message.reply_text("Reply to a bot-created backup document with /restore.")
+        return
+    if not reply.from_user or not reply.from_user.is_bot:
+        await update.effective_message.reply_text("That document was not created by this bot.")
+        return
+    archive = config.data_dir / f"restore-{update.effective_user.id}.zip"
+    await context.bot.send_chat_action(update.effective_chat.id, ChatAction.UPLOAD_DOCUMENT)
+    telegram_file = await reply.document.get_file()
+    await telegram_file.download_to_drive(archive)
+    try:
+        digest_match = re.search(r"sha256:([0-9a-f]{64})", reply.caption)
+        user_match = re.search(r"user:(\d+)", reply.caption)
+        if not digest_match or not user_match or int(user_match.group(1)) != update.effective_user.id:
+            raise ValueError("Backup metadata does not match")
+        count = restore_backup(context.application.bot_data["database"], config.data_dir, archive, update.effective_user.id, digest_match.group(1))
+        await update.effective_message.reply_text(f"Restored {count} GIF(s).")
+    except (ValueError, OSError, KeyError) as error:
+        logger.warning("Restore rejected: %s", error)
+        await update.effective_message.reply_text("Restore rejected: the backup is invalid or belongs to another user.")
+    finally:
+        archive.unlink(missing_ok=True)
+
+
+async def button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    if query.data == "save":
+        await query.message.reply_text("Use /save, then send one GIF.")
+    elif query.data == "list":
+        await list_gifs(update, context)
+    elif query.data == "backup":
+        await backup(update, context)
+    else:
+        await query.message.reply_text("Random GIF browsing will be added next.")
+
+
+def build_application(config: Config) -> Application:
+    application = Application.builder().token(config.token).build()
+    application.bot_data["config"] = config
+    application.bot_data["database"] = Database(config.data_dir / "gifs.db")
+    save_flow = ConversationHandler(
+        entry_points=[CommandHandler("save", save_command)],
+        states={WAITING_FOR_GIF: [MessageHandler(filters.ANIMATION | filters.Document.MimeType("image/gif"), receive_gif)]},
+        fallbacks=[CommandHandler("cancel", cancel)],
+        allow_reentry=True,
+    )
+    application.add_handler(CommandHandler(["start", "help"], start))
+    application.add_handler(save_flow)
+    application.add_handler(CommandHandler("list", list_gifs))
+    application.add_handler(CommandHandler("backup", backup))
+    application.add_handler(CommandHandler("restore", restore))
+    application.add_handler(CommandHandler("cancel", cancel))
+    application.add_handler(CallbackQueryHandler(button))
+    return application
+
+
+def main() -> None:
+    config = Config.from_environment()
+    config.data_dir.mkdir(parents=True, exist_ok=True)
+    build_application(config).run_polling()
+
+
+if __name__ == "__main__":
+    main()

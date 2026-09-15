@@ -65,4 +65,6 @@ The bot should validate backup archives before replacing local data and keep the
 
 ## Status
 
-Concept and initial requirements only. Implementation and deployment scaffolding are still to be created.
+Initial implementation is available. Copy `.env.example` to `.env`, set the bot token and one or more Telegram user IDs in `ALLOWED_USER_IDS`, then run `docker compose up --build`.
+
+The bot currently implements the allowlist, help/menu, single-GIF saving, exact deduplication, per-user local storage, manual `/backup`, and reply-based `/restore`. Browse, search, tagging, and random retrieval remain on the TODO list.
