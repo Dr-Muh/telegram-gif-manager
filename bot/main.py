@@ -4,6 +4,7 @@ import logging
 from pathlib import Path
 import re
 import sys
+import zipfile
 from collections import deque
 
 from telegram import (
@@ -454,6 +455,11 @@ async def restore(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not reply.from_user or not reply.from_user.is_bot:
         await update.effective_message.reply_text("That document was not created by this bot.")
         return
+    if reply.caption.startswith("GIF Manager backup part"):
+        await update.effective_message.reply_text(
+            "This is only one backup part. Reply to the final backup manifest with /restore."
+        )
+        return
     archive = config.data_dir / f"restore-{update.effective_user.id}.zip"
     await context.bot.send_chat_action(update.effective_chat.id, ChatAction.UPLOAD_DOCUMENT)
     telegram_file = await reply.document.get_file()
@@ -491,9 +497,9 @@ async def restore(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             raise ValueError("Backup metadata does not match")
         count = restore_backup(context.application.bot_data["database"], config.data_dir, archive, update.effective_user.id, expected_digest)
         await update.effective_message.reply_text(f"Restored {count} GIF(s).")
-    except (ValueError, OSError, KeyError) as error:
+    except (ValueError, OSError, KeyError, json.JSONDecodeError, zipfile.BadZipFile) as error:
         logger.warning("Restore rejected: %s", error)
-        await update.effective_message.reply_text("Restore rejected: the backup is invalid or belongs to another user.")
+        await update.effective_message.reply_text(f"Restore rejected: {error}")
     finally:
         archive.unlink(missing_ok=True)
 

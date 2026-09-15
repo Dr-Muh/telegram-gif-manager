@@ -54,18 +54,22 @@ def restore_backup(database: Database, data_dir: Path, archive: Path, user_id: i
         records = manifest.get("records", [])
         if not isinstance(records, list):
             raise ValueError("Invalid backup records")
+        normalized_records = []
         for record in records:
-            relative_path = Path(str(record["file_path"]))
+            relative_path = Path(str(record["file_path"]).replace("\\", "/"))
             if relative_path.is_absolute() or ".." in relative_path.parts or relative_path.parts[:2] != ("gifs", str(user_id)):
                 raise ValueError("Backup contains an unsafe media path")
             source = temporary_path / "media" / relative_path.name
             if not source.is_file():
                 raise ValueError("Backup is missing media files")
+            normalized_record = dict(record)
+            normalized_record["file_path"] = relative_path.as_posix()
+            normalized_records.append(normalized_record)
         user_dir = data_dir / "gifs" / str(user_id)
         user_dir.mkdir(parents=True, exist_ok=True)
-        for record in records:
-            relative_path = Path(str(record["file_path"]))
+        for record in normalized_records:
+            relative_path = Path(str(record["file_path"]).replace("\\", "/"))
             source = temporary_path / "media" / relative_path.name
             shutil.copy2(source, data_dir / relative_path)
-        database.replace_user_data(user_id, records)
-        return len(records)
+        database.replace_user_data(user_id, normalized_records)
+        return len(normalized_records)
