@@ -5,7 +5,7 @@ import re
 import sys
 from collections import deque
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaAnimation, Update
 from telegram.constants import ChatAction
 from telegram.ext import (
     Application, CallbackQueryHandler, CommandHandler, ContextTypes,
@@ -43,6 +43,19 @@ def menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("Save GIF", callback_data="save"), InlineKeyboardButton("Browse", callback_data="list")],
         [InlineKeyboardButton("Random GIF", callback_data="random"), InlineKeyboardButton("Backup", callback_data="backup")],
+    ])
+
+
+def browse_menu(index: int, total: int) -> InlineKeyboardMarkup:
+    previous_index = (index - 1) % total
+    next_index = (index + 1) % total
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("Previous", callback_data=f"browse:{previous_index}"),
+            InlineKeyboardButton(f"{index + 1} / {total}", callback_data="browse:noop"),
+            InlineKeyboardButton("Next", callback_data=f"browse:{next_index}"),
+        ],
+        [InlineKeyboardButton("Back to menu", callback_data="menu")],
     ])
 
 
@@ -157,7 +170,37 @@ async def list_gifs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not allowed(update, config):
         return await deny(update)
     records = context.application.bot_data["database"].list_gifs(update.effective_user.id)
-    await update.effective_message.reply_text(f"You have {len(records)} saved GIF(s).", reply_markup=menu())
+    if not records:
+        await update.effective_message.reply_text("You have no saved GIFs yet.", reply_markup=menu())
+        return
+    record = records[0]
+    caption = f"GIF 1 / {len(records)}\nSHA-256: {record['sha256'][:12]}..."
+    if update.callback_query:
+        await update.callback_query.edit_message_media(
+            media=InputMediaAnimation(media=record["file_id"], caption=caption),
+            reply_markup=browse_menu(0, len(records)),
+        )
+    else:
+        await update.effective_message.reply_animation(
+            record["file_id"], caption=caption, reply_markup=browse_menu(0, len(records))
+        )
+
+
+async def browse_gif(update: Update, context: ContextTypes.DEFAULT_TYPE, index: int) -> None:
+    query = update.callback_query
+    records = context.application.bot_data["database"].list_gifs(update.effective_user.id)
+    if not records:
+        await query.edit_message_text("You have no saved GIFs yet.", reply_markup=menu())
+        return
+    index %= len(records)
+    record = records[index]
+    await query.edit_message_media(
+        media=InputMediaAnimation(
+            media=record["file_id"],
+            caption=f"GIF {index + 1} / {len(records)}\nSHA-256: {record['sha256'][:12]}...",
+        ),
+        reply_markup=browse_menu(index, len(records)),
+    )
 
 
 async def backup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -213,6 +256,11 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if query.data == "save":
         context.user_data["awaiting_gif"] = True
         await query.message.reply_text("Send one GIF now. Use /cancel to stop.")
+    elif query.data.startswith("browse:"):
+        if query.data != "browse:noop":
+            await browse_gif(update, context, int(query.data.split(":", 1)[1]))
+    elif query.data == "menu":
+        await query.message.reply_text("Choose an action:", reply_markup=menu())
     elif query.data == "list":
         await list_gifs(update, context)
     elif query.data == "backup":
@@ -232,7 +280,7 @@ def build_application(config: Config) -> Application:
     application.add_handler(CommandHandler("list", list_gifs))
     application.add_handler(CommandHandler("backup", backup))
     application.add_handler(CommandHandler("restore", restore))
-    application.add_handler(CallbackQueryHandler(button, pattern="^(save|list|backup|random)$"))
+    application.add_handler(CallbackQueryHandler(button, pattern="^(save|list|backup|random|menu|browse:.*)$"))
     return application
 
 
