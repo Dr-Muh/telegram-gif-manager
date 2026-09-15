@@ -4,6 +4,8 @@ services:
     restart: unless-stopped
     env_file:
       - .env
+    environment:
+      DATA_DIR: /data
     volumes:
       - gif-manager-data:/data
 

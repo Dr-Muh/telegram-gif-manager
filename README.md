@@ -68,3 +68,14 @@ The bot should validate backup archives before replacing local data and keep the
 Initial implementation is available. Copy `.env.example` to `.env`, set the bot token and one or more Telegram user IDs in `ALLOWED_USER_IDS`, then run `docker compose up --build`.
 
 The bot currently implements the allowlist, help/menu, single-GIF saving, exact deduplication, per-user local storage, manual `/backup`, and reply-based `/restore`. Browse, search, tagging, and random retrieval remain on the TODO list.
+
+## Run without Docker
+
+Install the dependencies with `python -m pip install -r requirements.txt`, then set `BOT_TOKEN`, `ALLOWED_USER_IDS`, and optionally `DATA_DIR` in the process environment. From the repository root, either command works:
+
+```powershell
+python -m bot.main
+python bot/main.py
+```
+
+Without Docker, data defaults to `./data` inside the project and can be changed with `DATA_DIR`. Docker overrides this setting and stores data in its persistent `/data` volume. The bot requires a valid token and at least one allowlisted Telegram user ID before it starts polling.

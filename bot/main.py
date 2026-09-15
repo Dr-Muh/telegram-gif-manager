@@ -2,21 +2,31 @@ import hashlib
 import logging
 from pathlib import Path
 import re
+import sys
+from collections import deque
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction
 from telegram.ext import (
     Application, CallbackQueryHandler, CommandHandler, ContextTypes,
-    ConversationHandler, MessageHandler, filters,
+    MessageHandler, filters,
 )
 
-from .backup import create_backup, restore_backup
-from .config import Config
-from .database import Database
+if __package__:
+    from .backup import create_backup, restore_backup
+    from .config import Config
+    from .database import Database
+else:
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from bot.backup import create_backup, restore_backup
+    from bot.config import Config
+    from bot.database import Database
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
-WAITING_FOR_GIF = 1
+MAX_PROCESSED_CALLBACKS = 1000
 
 
 def allowed(update: Update, config: Config) -> bool:
@@ -36,7 +46,37 @@ def menu() -> InlineKeyboardMarkup:
     ])
 
 
+def claim_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    query = update.callback_query
+    processed_callbacks = context.application.bot_data.setdefault("processed_callbacks", deque(maxlen=MAX_PROCESSED_CALLBACKS))
+    if query.id in processed_callbacks:
+        return False
+    processed_callbacks.append(query.id)
+    return True
+
+
+def claim_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    message = update.effective_message
+    chat = update.effective_chat
+    if message is None or chat is None:
+        return False
+    message_key = (chat.id, message.message_id)
+    processed_messages = context.application.bot_data.setdefault("processed_messages", deque(maxlen=MAX_PROCESSED_CALLBACKS))
+    if message_key in processed_messages:
+        return False
+    processed_messages.append(message_key)
+    return True
+
+
+def claim_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    if update.callback_query:
+        return True
+    return claim_message(update, context)
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not claim_message(update, context):
+        return
     config: Config = context.application.bot_data["config"]
     if not allowed(update, config):
         return await deny(update)
@@ -49,28 +89,35 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
-async def save_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def save_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not claim_update(update, context):
+        return
     config: Config = context.application.bot_data["config"]
     if not allowed(update, config):
         await deny(update)
-        return ConversationHandler.END
+        return None
+    context.user_data["awaiting_gif"] = True
     await update.effective_message.reply_text("Send one GIF now. Use /cancel to stop.")
-    return WAITING_FOR_GIF
+    return None
 
 
-async def receive_gif(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def receive_gif(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not claim_update(update, context):
+        return
     config: Config = context.application.bot_data["config"]
+    if not context.user_data.get("awaiting_gif"):
+        return None
     if not allowed(update, config):
         await deny(update)
-        return ConversationHandler.END
+        return None
     message = update.effective_message
     media = message.animation or (message.document if message.document and message.document.mime_type == "image/gif" else None)
     if media is None:
         await message.reply_text("Please send a GIF animation or a GIF document, or use /cancel.")
-        return WAITING_FOR_GIF
+        return None
     if media.file_size and media.file_size > config.max_file_size:
         await message.reply_text("That GIF is larger than the configured file-size limit.")
-        return WAITING_FOR_GIF
+        return None
     user_id = update.effective_user.id
     data_dir: Path = config.data_dir
     user_dir = data_dir / "gifs" / str(user_id)
@@ -83,22 +130,29 @@ async def receive_gif(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     existing = database.find_by_hash(user_id, digest)
     if existing:
         temporary_path.unlink(missing_ok=True)
+        context.user_data.pop("awaiting_gif", None)
         await message.reply_animation(existing["file_id"], caption="Already saved: this GIF is a duplicate.")
-        return ConversationHandler.END
+        return None
     destination = user_dir / f"{digest}.gif"
     temporary_path.replace(destination)
     database.add_gif(user_id, digest, str(destination.relative_to(data_dir)), media.file_id)
+    context.user_data.pop("awaiting_gif", None)
     await message.reply_text("GIF saved.")
-    return ConversationHandler.END
+    return None
 
 
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not claim_update(update, context):
+        return
+    context.user_data.pop("awaiting_gif", None)
     if update.effective_message:
         await update.effective_message.reply_text("Cancelled.")
-    return ConversationHandler.END
+    return None
 
 
 async def list_gifs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not claim_update(update, context):
+        return
     config: Config = context.application.bot_data["config"]
     if not allowed(update, config):
         return await deny(update)
@@ -107,6 +161,8 @@ async def list_gifs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def backup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not claim_update(update, context):
+        return
     config: Config = context.application.bot_data["config"]
     if not allowed(update, config):
         return await deny(update)
@@ -119,6 +175,8 @@ async def backup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def restore(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not claim_update(update, context):
+        return
     config: Config = context.application.bot_data["config"]
     if not allowed(update, config):
         return await deny(update)
@@ -149,9 +207,12 @@ async def restore(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
+    if not claim_callback(update, context):
+        return
     await query.answer()
     if query.data == "save":
-        await query.message.reply_text("Use /save, then send one GIF.")
+        context.user_data["awaiting_gif"] = True
+        await query.message.reply_text("Send one GIF now. Use /cancel to stop.")
     elif query.data == "list":
         await list_gifs(update, context)
     elif query.data == "backup":
@@ -164,19 +225,14 @@ def build_application(config: Config) -> Application:
     application = Application.builder().token(config.token).build()
     application.bot_data["config"] = config
     application.bot_data["database"] = Database(config.data_dir / "gifs.db")
-    save_flow = ConversationHandler(
-        entry_points=[CommandHandler("save", save_command)],
-        states={WAITING_FOR_GIF: [MessageHandler(filters.ANIMATION | filters.Document.MimeType("image/gif"), receive_gif)]},
-        fallbacks=[CommandHandler("cancel", cancel)],
-        allow_reentry=True,
-    )
     application.add_handler(CommandHandler(["start", "help"], start))
-    application.add_handler(save_flow)
+    application.add_handler(CommandHandler("save", save_command))
+    application.add_handler(CommandHandler("cancel", cancel))
+    application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, receive_gif))
     application.add_handler(CommandHandler("list", list_gifs))
     application.add_handler(CommandHandler("backup", backup))
     application.add_handler(CommandHandler("restore", restore))
-    application.add_handler(CommandHandler("cancel", cancel))
-    application.add_handler(CallbackQueryHandler(button))
+    application.add_handler(CallbackQueryHandler(button, pattern="^(save|list|backup|random)$"))
     return application
 
 
