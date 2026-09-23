@@ -2,6 +2,7 @@ import hashlib
 import json
 import logging
 from pathlib import Path
+import random
 import re
 import sys
 import zipfile
@@ -187,7 +188,7 @@ async def inline_gifs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     records = context.application.bot_data["database"].list_gifs(user.id)
     if query:
         records = [record for record in records if query in record["tags"].casefold()]
-    records = records[:MAX_INLINE_RESULTS]
+    records = random.sample(records, k=min(len(records), MAX_INLINE_RESULTS))
     results = [
         InlineQueryResultCachedGif(
             id=f"gif-{record['id']}",
