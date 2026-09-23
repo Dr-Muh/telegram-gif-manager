@@ -99,3 +99,4 @@ Without Docker, data defaults to `./data` inside the project and can be changed 
 
 docker build --platform linux/amd64 -t telegram-gif-manager .
 docker save -o telegram-gif-manager.tar telegram-gif-manager
+docker image rm telegram-gif-manager:latest
