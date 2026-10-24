@@ -110,6 +110,12 @@ class Database:
         )
         self.connection.commit()
 
+    def gif_counts(self) -> dict[int, int]:
+        return {
+            row["user_id"]: row["count"]
+            for row in self.connection.execute("SELECT user_id, COUNT(*) AS count FROM gifs GROUP BY user_id")
+        }
+
     def is_allowed_user(self, user_id: int) -> bool:
         return self.connection.execute(
             "SELECT 1 FROM allowed_users WHERE user_id = ?", (user_id,)

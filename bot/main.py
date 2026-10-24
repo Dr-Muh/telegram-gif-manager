@@ -5,6 +5,7 @@ import logging
 from pathlib import Path
 import random
 import re
+import shutil
 import sys
 import zipfile
 from collections import deque
@@ -657,16 +658,67 @@ async def revoke_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.effective_message.reply_text(f"User {user_id} was not allowed.")
 
 
+def format_size(size: float) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024:
+            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} TB"
+
+
+def directory_size(path: Path) -> int:
+    return sum(file.stat().st_size for file in path.rglob("*") if file.is_file())
+
+
+async def display_name(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> str:
+    try:
+        chat = await context.bot.get_chat(user_id)
+    except TelegramError:
+        # Telegram only knows the chat once the user has started the bot.
+        return "unknown (has not started the bot yet)"
+    name = " ".join(part for part in (chat.first_name, chat.last_name) if part) or "no name"
+    return f"{name} (@{chat.username})" if chat.username else name
+
+
 async def list_users(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not claim_message(update, context) or not await require_admin(update, context):
         return
     config: Config = context.application.bot_data["config"]
-    admins = "\n".join(str(user_id) for user_id in sorted(config.admin_user_ids))
-    allowed_users = "\n".join(
-        f"{record['user_id']} (added by {record['added_by']} on {record['created_at']})"
-        for record in context.application.bot_data["database"].list_allowed_users()
-    ) or "none"
-    await update.effective_message.reply_text(f"Admins:\n{admins}\n\nAllowed users:\n{allowed_users}")
+    database: Database = context.application.bot_data["database"]
+    admin_ids = sorted(config.admin_user_ids)
+    allowed_records = [record for record in database.list_allowed_users() if record["user_id"] not in config.admin_user_ids]
+    gif_counts = database.gif_counts()
+    listed_ids = set(admin_ids) | {record["user_id"] for record in allowed_records}
+    revoked_ids = sorted(set(gif_counts) - listed_ids)
+    user_ids = admin_ids + [record["user_id"] for record in allowed_records] + revoked_ids
+
+    names = dict(zip(user_ids, await asyncio.gather(*(display_name(context, user_id) for user_id in user_ids))))
+    sizes = dict(zip(user_ids, await asyncio.gather(*(
+        asyncio.to_thread(directory_size, config.data_dir / "gifs" / str(user_id)) for user_id in user_ids
+    ))))
+    data_size = await asyncio.to_thread(directory_size, config.data_dir)
+    disk = shutil.disk_usage(config.data_dir)
+
+    def describe(user_id: int, details: str = "") -> str:
+        return (
+            f"- {names[user_id]}\n"
+            f"  ID {user_id} | {gif_counts.get(user_id, 0)} GIF(s), {format_size(sizes[user_id])}{details}"
+        )
+
+    sections = [
+        "Admins:\n" + "\n".join(describe(user_id) for user_id in admin_ids),
+        "Allowed users:\n" + ("\n".join(
+            describe(record["user_id"], f"\n  added by {record['added_by']} on {record['created_at']}")
+            for record in allowed_records
+        ) or "none"),
+    ]
+    if revoked_ids:
+        sections.append("Revoked users with stored GIFs:\n" + "\n".join(describe(user_id) for user_id in revoked_ids))
+    sections.append(
+        f"Storage:\nBot data: {format_size(data_size)}\n"
+        f"Free on host: {format_size(disk.free)} of {format_size(disk.total)}"
+    )
+    await update.effective_message.reply_text("\n\n".join(sections))
 
 
 async def button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

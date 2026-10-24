@@ -119,3 +119,12 @@ def test_split_archive_parts_reassemble_to_the_original(tmp_path: Path) -> None:
 
     assert len(parts) == 3
     assert sha256_file(reassembled) == sha256_file(archive)
+
+
+def test_gif_counts_are_grouped_by_user(tmp_path: Path) -> None:
+    database, _ = make_database(tmp_path)
+    database.add_gif(10, "a", "gifs/10/a.gif", "file-a")
+    database.add_gif(10, "b", "gifs/10/b.gif", "file-b")
+    database.add_gif(20, "a", "gifs/20/a.gif", "file-c")
+
+    assert database.gif_counts() == {10: 2, 20: 1}
