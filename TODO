@@ -9,6 +9,7 @@
 - [x] Single-GIF saving only
 - [x] No Telegram user credentials
 - [x] Restrict access with an allowlist of Telegram user IDs
+- [x] Admins from `ADMIN_USER_IDS`; allowed users stored in the database and managed with `/allow`, `/revoke`, `/users`
 - [ ] Decide default backup interval and retention count
 
 ## Bot behavior
@@ -48,7 +49,7 @@
 
 - [x] Add `Dockerfile`
 - [x] Add `docker-compose.yml` with a `/data` volume
-- [x] Add `.env.example` with `BOT_TOKEN`, `ALLOWED_USER_IDS`, and storage settings
+- [x] Add `.env.example` with `BOT_TOKEN`, `ADMIN_USER_IDS`, and storage settings
 - [ ] Add health logging and graceful shutdown
 - [ ] Document private bot-chat backup and restore setup
 - [ ] Document backup security and recovery procedure

@@ -13,8 +13,20 @@ from .database import Database
 PREFIX = "telegram-gif-manager-backup"
 
 
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def create_backup(database: Database, data_dir: Path, user_id: int) -> tuple[Path, str]:
-    records = [dict(row) for row in database.list_gifs(user_id)]
+    return write_backup_archive([dict(row) for row in database.list_gifs(user_id)], data_dir, user_id)
+
+
+def write_backup_archive(records: list[dict[str, object]], data_dir: Path, user_id: int) -> tuple[Path, str]:
+    """Builds the archive without touching the database, so it can run in a worker thread."""
     file_descriptor, archive_name = tempfile.mkstemp(prefix=f"{PREFIX}-{user_id}-", suffix=".zip")
     os.close(file_descriptor)
     archive = Path(archive_name)
@@ -31,15 +43,23 @@ def create_backup(database: Database, data_dir: Path, user_id: int) -> tuple[Pat
                 source = data_dir / record["file_path"]
                 if source.is_file():
                     zip_file.write(source, f"media/{source.name}")
-        digest = hashlib.sha256(archive.read_bytes()).hexdigest()
-        return archive, digest
+        return archive, sha256_file(archive)
     except Exception:
         archive.unlink(missing_ok=True)
         raise
 
 
 def restore_backup(database: Database, data_dir: Path, archive: Path, user_id: int, expected_digest: str | None = None) -> int:
-    if expected_digest and hashlib.sha256(archive.read_bytes()).hexdigest() != expected_digest:
+    records = extract_backup_archive(data_dir, archive, user_id, expected_digest)
+    database.replace_user_data(user_id, records)
+    return len(records)
+
+
+def extract_backup_archive(
+    data_dir: Path, archive: Path, user_id: int, expected_digest: str | None = None
+) -> list[dict[str, object]]:
+    """Validates the archive and copies its media without touching the database, so it can run in a worker thread."""
+    if expected_digest and sha256_file(archive) != expected_digest:
         raise ValueError("Backup checksum does not match")
     with tempfile.TemporaryDirectory() as temporary_dir:
         temporary_path = Path(temporary_dir)
@@ -71,5 +91,19 @@ def restore_backup(database: Database, data_dir: Path, archive: Path, user_id: i
             relative_path = Path(str(record["file_path"]).replace("\\", "/"))
             source = temporary_path / "media" / relative_path.name
             shutil.copy2(source, data_dir / relative_path)
-        database.replace_user_data(user_id, normalized_records)
-        return len(normalized_records)
+        return normalized_records
+
+
+def split_archive(archive: Path, directory: Path, part_size: int) -> list[Path]:
+    parts = []
+    with archive.open("rb") as source:
+        for part_number, chunk in enumerate(iter(lambda: source.read(part_size), b""), start=1):
+            part_path = directory / f"{archive.stem}.part{part_number:03}.zip"
+            part_path.write_bytes(chunk)
+            parts.append(part_path)
+    return parts
+
+
+def append_file(source: Path, destination: Path) -> None:
+    with source.open("rb") as input_file, destination.open("ab") as output_file:
+        shutil.copyfileobj(input_file, output_file)

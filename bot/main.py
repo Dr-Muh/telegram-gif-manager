@@ -1,4 +1,5 @@
-import hashlib
+import asyncio
+from contextlib import asynccontextmanager
 import json
 import logging
 from pathlib import Path
@@ -7,25 +8,26 @@ import re
 import sys
 import zipfile
 from collections import deque
+from typing import AsyncIterator
 
 from telegram import (
     InlineKeyboardButton, InlineKeyboardMarkup, InlineQueryResultCachedGif,
-    InputMediaAnimation, Update,
+    InputMediaAnimation, Message, Update,
 )
 from telegram.constants import ChatAction
-from telegram.error import TimedOut
+from telegram.error import BadRequest, TelegramError, TimedOut
 from telegram.ext import (
     Application, CallbackQueryHandler, CommandHandler, ContextTypes,
     InlineQueryHandler, MessageHandler, filters,
 )
 
 if __package__:
-    from .backup import create_backup, restore_backup
+    from .backup import append_file, extract_backup_archive, sha256_file, split_archive, write_backup_archive
     from .config import Config
     from .database import Database
 else:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-    from bot.backup import create_backup, restore_backup
+    from bot.backup import append_file, extract_backup_archive, sha256_file, split_archive, write_backup_archive
     from bot.config import Config
     from bot.database import Database
 
@@ -35,17 +37,40 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 MAX_PROCESSED_CALLBACKS = 1000
 MAX_INLINE_RESULTS = 50
+MAX_PENDING_GIFS = 20
 BACKUP_PART_SIZE = 19 * 1024 * 1024
 
 
-def allowed(update: Update, config: Config) -> bool:
+def is_admin(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    return user_id in context.application.bot_data["config"].admin_user_ids
+
+
+def is_allowed(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    return is_admin(user_id, context) or context.application.bot_data["database"].is_allowed_user(user_id)
+
+
+def allowed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     user = update.effective_user
-    return user is not None and user.id in config.allowed_user_ids
+    return user is not None and is_allowed(user.id, context)
 
 
 async def deny(update: Update) -> None:
     if update.effective_message:
-        await update.effective_message.reply_text("This bot is private and your account is not allowlisted.")
+        user = update.effective_user
+        user_id_hint = f" Your Telegram user ID is {user.id}; send it to the bot admin to request access." if user else ""
+        await update.effective_message.reply_text(f"This bot is private and your account is not allowlisted.{user_id_hint}")
+
+
+def reset_modes(context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.user_data.pop("save_mode", None)
+    context.user_data.pop("editing_gif_id", None)
+
+
+def remove_stale_temporary_files(data_dir: Path) -> None:
+    # Pending GIFs live in user_data, which does not survive a restart.
+    for pattern in (".pending-*.gif", ".*.part"):
+        for path in data_dir.glob(f"gifs/*/{pattern}"):
+            path.unlink(missing_ok=True)
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -164,24 +189,26 @@ def claim_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not claim_message(update, context):
         return
-    config: Config = context.application.bot_data["config"]
-    if not allowed(update, config):
+    if not allowed(update, context):
         return await deny(update)
-    context.user_data.pop("save_mode", None)
+    reset_modes(context)
+    admin_help = (
+        "\n\nAdmin commands:\n/allow <user ID> - allow a user\n/revoke <user ID> - revoke a user's access\n"
+        "/users - list admins and allowed users"
+    ) if is_admin(update.effective_user.id, context) else ""
     await update.effective_message.reply_text(
         "Telegram GIF Manager\n\n"
         "/save - save the next GIF\n/list - browse your GIFs\n/random - get a random GIF\n"
         "/bulk_save - save GIFs until /cancel or another command\n"
         "/backup - back up your data here\n/restore - reply to a bot backup with this command\n"
-        "/cancel - cancel saving\n/delete - reply to a saved GIF to delete it\n/help - show this menu",
+        "/cancel - cancel saving\n/delete - reply to a saved GIF to delete it\n/help - show this menu" + admin_help,
         reply_markup=menu(),
     )
 
 
 async def inline_gifs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    config: Config = context.application.bot_data["config"]
     user = update.inline_query.from_user
-    if user.id not in config.allowed_user_ids:
+    if not is_allowed(user.id, context):
         await update.inline_query.answer([], cache_time=0, is_personal=True)
         return
     query = update.inline_query.query.strip().casefold()
@@ -203,10 +230,10 @@ async def inline_gifs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 async def save_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not claim_update(update, context):
         return
-    config: Config = context.application.bot_data["config"]
-    if not allowed(update, config):
+    if not allowed(update, context):
         await deny(update)
         return None
+    reset_modes(context)
     context.user_data["save_mode"] = "single"
     await update.effective_message.reply_text("Send one GIF now. Use /cancel to stop.")
     return None
@@ -215,10 +242,10 @@ async def save_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 async def bulk_save_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not claim_update(update, context):
         return
-    config: Config = context.application.bot_data["config"]
-    if not allowed(update, config):
+    if not allowed(update, context):
         await deny(update)
         return
+    reset_modes(context)
     context.user_data["save_mode"] = "bulk"
     await update.effective_message.reply_text("Send GIFs now. I will keep saving them until /cancel or another command.")
 
@@ -228,7 +255,7 @@ async def receive_gif(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
     config: Config = context.application.bot_data["config"]
     save_mode = context.user_data.get("save_mode")
-    if not allowed(update, config):
+    if not allowed(update, context):
         await deny(update)
         return None
     message = update.effective_message
@@ -245,14 +272,21 @@ async def receive_gif(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     data_dir: Path = config.data_dir
     user_dir = data_dir / "gifs" / str(user_id)
     user_dir.mkdir(parents=True, exist_ok=True)
-    telegram_file = await media.get_file()
+    try:
+        telegram_file = await media.get_file()
+    except BadRequest as error:
+        logger.warning("Could not fetch GIF for user %s: %s", user_id, error)
+        await message.reply_text("Telegram does not allow bots to download this GIF. It is probably larger than 20 MB.")
+        return None
     temporary_path = user_dir / f".{media.file_unique_id}.part"
     await telegram_file.download_to_drive(temporary_path)
-    digest = hashlib.sha256(temporary_path.read_bytes()).hexdigest()
+    digest = await asyncio.to_thread(sha256_file, temporary_path)
     database: Database = context.application.bot_data["database"]
     existing = database.find_by_hash(user_id, digest)
     if existing:
         temporary_path.unlink(missing_ok=True)
+        if not existing["file_unique_id"]:
+            database.set_file_unique_id(user_id, existing["id"], media.file_unique_id)
         if not save_mode:
             await show_browsed_gif(update, context, existing["id"])
             return None
@@ -263,20 +297,25 @@ async def receive_gif(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not save_mode:
         pending_path = user_dir / f".pending-{message.message_id}-{digest}.gif"
         temporary_path.replace(pending_path)
-        context.user_data["pending_gif"] = {
-            "path": str(pending_path),
-            "sha256": digest,
-            "file_id": media.file_id,
-        }
-        await message.reply_animation(
+        prompt = await message.reply_animation(
             media.file_id,
             caption="This GIF is not saved yet. Would you like to save it?",
             reply_markup=pending_gif_menu(),
         )
+        pending_gifs = context.user_data.setdefault("pending_gifs", {})
+        pending_gifs[prompt.message_id] = {
+            "path": str(pending_path),
+            "sha256": digest,
+            "file_id": media.file_id,
+            "file_unique_id": media.file_unique_id,
+        }
+        while len(pending_gifs) > MAX_PENDING_GIFS:
+            expired = pending_gifs.pop(next(iter(pending_gifs)))
+            Path(expired["path"]).unlink(missing_ok=True)
         return None
     destination = user_dir / f"{digest}.gif"
     temporary_path.replace(destination)
-    database.add_gif(user_id, digest, str(destination.relative_to(data_dir)), media.file_id)
+    database.add_gif(user_id, digest, str(destination.relative_to(data_dir)), media.file_id, media.file_unique_id)
     if save_mode == "single":
         context.user_data.pop("save_mode", None)
         await message.reply_text("GIF saved.")
@@ -286,10 +325,12 @@ async def receive_gif(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 async def receive_tags(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if "editing_gif_id" not in context.user_data:
+        await receive_gif(update, context)
+        return
     if not claim_update(update, context):
         return
-    config: Config = context.application.bot_data["config"]
-    if not allowed(update, config) or "editing_gif_id" not in context.user_data:
+    if not allowed(update, context):
         return
     tags = ", ".join(
         tag.strip() for tag in update.effective_message.text.split(",") if tag.strip()
@@ -308,7 +349,7 @@ async def delete_gif(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if not claim_update(update, context):
         return
     config: Config = context.application.bot_data["config"]
-    if not allowed(update, config):
+    if not allowed(update, context):
         return await deny(update)
     reply = update.effective_message.reply_to_message
     media = reply.animation if reply else None
@@ -316,7 +357,11 @@ async def delete_gif(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await update.effective_message.reply_text("Reply to a GIF sent by this bot with /delete.")
         return
     database: Database = context.application.bot_data["database"]
-    record = database.find_by_file_id(update.effective_user.id, media.file_id)
+    # Older records may not have a file_unique_id yet, so fall back to the file_id.
+    record = (
+        database.find_by_file_unique_id(update.effective_user.id, media.file_unique_id)
+        or database.find_by_file_id(update.effective_user.id, media.file_id)
+    )
     if not record:
         await update.effective_message.reply_text("That GIF is not in your saved library.")
         return
@@ -329,7 +374,7 @@ async def delete_gif(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not claim_update(update, context):
         return
-    context.user_data.pop("save_mode", None)
+    reset_modes(context)
     if update.effective_message:
         await update.effective_message.reply_text("Cancelled.")
     return None
@@ -338,10 +383,9 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def list_gifs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not claim_update(update, context):
         return
-    config: Config = context.application.bot_data["config"]
-    if not allowed(update, config):
+    if not allowed(update, context):
         return await deny(update)
-    context.user_data.pop("save_mode", None)
+    reset_modes(context)
     records = context.application.bot_data["database"].list_gifs(update.effective_user.id)
     if not records:
         await update.effective_message.reply_text("You have no saved GIFs yet.", reply_markup=menu())
@@ -380,75 +424,112 @@ async def browse_gif(update: Update, context: ContextTypes.DEFAULT_TYPE, index: 
     )
 
 
+def user_lock(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> asyncio.Lock:
+    return context.application.bot_data.setdefault("user_locks", {}).setdefault(user_id, asyncio.Lock())
+
+
+@asynccontextmanager
+async def chat_action(context: ContextTypes.DEFAULT_TYPE, chat_id: int, action: str) -> AsyncIterator[None]:
+    """Keeps a chat action visible; Telegram clears each one after about five seconds."""
+    async def repeat() -> None:
+        while True:
+            try:
+                await context.bot.send_chat_action(chat_id, action)
+            except TelegramError as error:
+                logger.debug("Could not send chat action: %s", error)
+            await asyncio.sleep(4)
+
+    task = asyncio.create_task(repeat())
+    try:
+        yield
+    finally:
+        task.cancel()
+
+
+async def set_status(message: Message, text: str) -> None:
+    try:
+        await message.edit_text(text)
+    except BadRequest as error:
+        logger.debug("Could not update status message: %s", error)
+
+
 async def backup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not claim_update(update, context):
         return
     config: Config = context.application.bot_data["config"]
-    if not allowed(update, config):
+    if not allowed(update, context):
         return await deny(update)
-    context.user_data.pop("save_mode", None)
-    await update.effective_message.reply_text("Backup started. I am preparing your GIF library now.")
-    archive, digest = create_backup(context.application.bot_data["database"], config.data_dir, update.effective_user.id)
-    try:
-        archive_size = archive.stat().st_size
-        part_count = (archive_size + BACKUP_PART_SIZE - 1) // BACKUP_PART_SIZE
-        if part_count == 1:
-            with archive.open("rb") as backup_file:
-                await update.effective_message.reply_document(backup_file, filename=archive.name, caption=f"GIF Manager backup | user:{update.effective_user.id} | sha256:{digest}")
-            return
+    reset_modes(context)
+    user_id = update.effective_user.id
+    lock = user_lock(context, user_id)
+    if lock.locked():
+        await update.effective_message.reply_text("A backup or restore is already running. Please wait until it finishes.")
+        return
+    async with lock, chat_action(context, update.effective_chat.id, ChatAction.UPLOAD_DOCUMENT):
+        status = await update.effective_message.reply_text("Backup started: creating the archive...")
+        records = [dict(row) for row in context.application.bot_data["database"].list_gifs(user_id)]
+        archive, digest = await asyncio.to_thread(write_backup_archive, records, config.data_dir, user_id)
+        try:
+            archive_size = archive.stat().st_size
+            part_count = (archive_size + BACKUP_PART_SIZE - 1) // BACKUP_PART_SIZE
+            if part_count == 1:
+                await set_status(status, "Backup: uploading the archive...")
+                with archive.open("rb") as backup_file:
+                    await update.effective_message.reply_document(backup_file, filename=archive.name, caption=f"GIF Manager backup | user:{user_id} | sha256:{digest}")
+                await set_status(status, f"Backup complete: {len(records)} GIF(s).")
+                return
 
-        parts = []
-        with archive.open("rb") as backup_file:
-            for part_number in range(1, part_count + 1):
-                part_path = config.data_dir / f"{archive.stem}.part{part_number:03}.zip"
-                part_path.write_bytes(backup_file.read(BACKUP_PART_SIZE))
-                parts.append(part_path)
-        uploaded_parts = []
-        for part_number, part_path in enumerate(parts, start=1):
-            with part_path.open("rb") as part_file:
-                sent = await update.effective_message.reply_document(
-                    part_file,
-                    filename=part_path.name,
-                    caption=f"GIF Manager backup part {part_number}/{part_count} | user:{update.effective_user.id}",
+            await set_status(status, f"Backup: splitting the archive into {part_count} parts...")
+            parts = await asyncio.to_thread(split_archive, archive, config.data_dir, BACKUP_PART_SIZE)
+            uploaded_parts = []
+            for part_number, part_path in enumerate(parts, start=1):
+                await set_status(status, f"Backup: uploading part {part_number}/{part_count}...")
+                with part_path.open("rb") as part_file:
+                    sent = await update.effective_message.reply_document(
+                        part_file,
+                        filename=part_path.name,
+                        caption=f"GIF Manager backup part {part_number}/{part_count} | user:{user_id}",
+                    )
+                uploaded_parts.append({
+                    "file_id": sent.document.file_id,
+                    "sha256": await asyncio.to_thread(sha256_file, part_path),
+                })
+            manifest = {
+                "format": 2,
+                "user_id": user_id,
+                "archive_sha256": digest,
+                "parts": uploaded_parts,
+            }
+            manifest_path = config.data_dir / f"{archive.stem}.manifest.json"
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            with manifest_path.open("rb") as manifest_file:
+                await update.effective_message.reply_document(
+                    manifest_file,
+                    filename=manifest_path.name,
+                    caption=f"GIF Manager backup manifest | user:{user_id} | parts:{part_count} | Reply to this file with /restore",
                 )
-            uploaded_parts.append({
-                "file_id": sent.document.file_id,
-                "sha256": hashlib.sha256(part_path.read_bytes()).hexdigest(),
-            })
-        manifest = {
-            "format": 2,
-            "user_id": update.effective_user.id,
-            "archive_sha256": digest,
-            "parts": uploaded_parts,
-        }
-        manifest_path = config.data_dir / f"{archive.stem}.manifest.json"
-        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
-        with manifest_path.open("rb") as manifest_file:
-            await update.effective_message.reply_document(
-                manifest_file,
-                filename=manifest_path.name,
-                caption=f"GIF Manager backup manifest | user:{update.effective_user.id} | parts:{part_count} | Reply to this file with /restore",
-            )
-        await update.effective_message.reply_text(f"Backup complete: {part_count} files plus a manifest. Reply to the manifest with /restore.")
-    except TimedOut:
-        logger.warning("Backup upload timed out for user %s", update.effective_user.id)
-        await update.effective_message.reply_text("The backup upload timed out. Please try /backup again.")
-    finally:
-        archive.unlink(missing_ok=True)
-        (config.data_dir / f"restore-{update.effective_user.id}.manifest.json").unlink(missing_ok=True)
-        (config.data_dir / f"restore-{update.effective_user.id}.part").unlink(missing_ok=True)
-        for part_path in config.data_dir.glob(f"{archive.stem}.part*.zip"):
-            part_path.unlink(missing_ok=True)
-        (config.data_dir / f"{archive.stem}.manifest.json").unlink(missing_ok=True)
+            await set_status(status, f"Backup complete: {len(records)} GIF(s) in {part_count} parts.")
+            await update.effective_message.reply_text(f"Backup complete: {part_count} files plus a manifest. Reply to the manifest with /restore.")
+        except TimedOut:
+            logger.warning("Backup upload timed out for user %s", user_id)
+            await set_status(status, "Backup failed: the upload timed out. Please try /backup again.")
+        except Exception:
+            await set_status(status, "Backup failed because of an unexpected error. Please try /backup again.")
+            raise
+        finally:
+            archive.unlink(missing_ok=True)
+            for part_path in config.data_dir.glob(f"{archive.stem}.part*.zip"):
+                part_path.unlink(missing_ok=True)
+            (config.data_dir / f"{archive.stem}.manifest.json").unlink(missing_ok=True)
 
 
 async def restore(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not claim_update(update, context):
         return
     config: Config = context.application.bot_data["config"]
-    if not allowed(update, config):
+    if not allowed(update, context):
         return await deny(update)
-        context.user_data.pop("save_mode", None)
+    reset_modes(context)
     reply = update.effective_message.reply_to_message
     if not reply or not reply.document or not reply.caption or not reply.caption.startswith("GIF Manager backup"):
         await update.effective_message.reply_text("Reply to a bot-created backup document with /restore.")
@@ -461,48 +542,131 @@ async def restore(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "This is only one backup part. Reply to the final backup manifest with /restore."
         )
         return
-    archive = config.data_dir / f"restore-{update.effective_user.id}.zip"
-    await context.bot.send_chat_action(update.effective_chat.id, ChatAction.UPLOAD_DOCUMENT)
-    telegram_file = await reply.document.get_file()
-    try:
-        expected_digest = None
-        if reply.caption.startswith("GIF Manager backup manifest"):
-            manifest_path = config.data_dir / f"restore-{update.effective_user.id}.manifest.json"
-            await telegram_file.download_to_drive(manifest_path)
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            if manifest.get("format") != 2 or manifest.get("user_id") != update.effective_user.id:
-                raise ValueError("Backup manifest belongs to another user")
-            parts = manifest.get("parts", [])
-            if not isinstance(parts, list) or not parts or len(parts) > 1000:
-                raise ValueError("Invalid backup manifest")
-            with archive.open("wb") as assembled:
-                for part in parts:
+    user_id = update.effective_user.id
+    lock = user_lock(context, user_id)
+    if lock.locked():
+        await update.effective_message.reply_text("A backup or restore is already running. Please wait until it finishes.")
+        return
+    archive = config.data_dir / f"restore-{user_id}.zip"
+    manifest_path = config.data_dir / f"restore-{user_id}.manifest.json"
+    part_path = config.data_dir / f"restore-{user_id}.part"
+    async with lock, chat_action(context, update.effective_chat.id, ChatAction.TYPING):
+        status = await update.effective_message.reply_text("Restore started: downloading the backup...")
+        try:
+            telegram_file = await reply.document.get_file()
+            expected_digest = None
+            if reply.caption.startswith("GIF Manager backup manifest"):
+                await telegram_file.download_to_drive(manifest_path)
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                if manifest.get("format") != 2 or manifest.get("user_id") != user_id:
+                    raise ValueError("Backup manifest belongs to another user")
+                parts = manifest.get("parts", [])
+                if not isinstance(parts, list) or not parts or len(parts) > 1000:
+                    raise ValueError("Invalid backup manifest")
+                archive.write_bytes(b"")
+                for part_number, part in enumerate(parts, start=1):
+                    await set_status(status, f"Restore: downloading part {part_number}/{len(parts)}...")
                     part_file = await context.bot.get_file(part["file_id"])
-                    part_path = config.data_dir / f"restore-{update.effective_user.id}.part"
                     await part_file.download_to_drive(part_path)
-                    if hashlib.sha256(part_path.read_bytes()).hexdigest() != part["sha256"]:
+                    if await asyncio.to_thread(sha256_file, part_path) != part["sha256"]:
                         raise ValueError("Backup part checksum does not match")
-                    with part_path.open("rb") as source:
-                        assembled.write(source.read())
+                    await asyncio.to_thread(append_file, part_path, archive)
                     part_path.unlink(missing_ok=True)
-            if hashlib.sha256(archive.read_bytes()).hexdigest() != manifest.get("archive_sha256"):
-                raise ValueError("Reassembled backup checksum does not match")
-            expected_digest = manifest["archive_sha256"]
+                await set_status(status, "Restore: verifying the backup...")
+                if await asyncio.to_thread(sha256_file, archive) != manifest.get("archive_sha256"):
+                    raise ValueError("Reassembled backup checksum does not match")
+                expected_digest = manifest["archive_sha256"]
+            else:
+                await telegram_file.download_to_drive(archive)
+                digest_match = re.search(r"sha256:([0-9a-f]{64})", reply.caption)
+                expected_digest = digest_match.group(1) if digest_match else None
+            user_match = re.search(r"user:(\d+)", reply.caption)
+            if not expected_digest or not user_match or int(user_match.group(1)) != user_id:
+                raise ValueError("Backup metadata does not match")
+            await set_status(status, "Restore: restoring your GIFs...")
+            records = await asyncio.to_thread(extract_backup_archive, config.data_dir, archive, user_id, expected_digest)
+            context.application.bot_data["database"].replace_user_data(user_id, records)
+            await set_status(status, f"Restored {len(records)} GIF(s).")
+        except (ValueError, OSError, KeyError, json.JSONDecodeError, zipfile.BadZipFile) as error:
+            logger.warning("Restore rejected: %s", error)
+            await set_status(status, f"Restore rejected: {error}")
+        except TimedOut:
+            logger.warning("Restore download timed out for user %s", user_id)
+            await set_status(status, "Restore failed: the download timed out. Please try /restore again.")
+        except Exception:
+            await set_status(status, "Restore failed because of an unexpected error. Please try /restore again.")
+            raise
+        finally:
+            archive.unlink(missing_ok=True)
             manifest_path.unlink(missing_ok=True)
-        else:
-            await telegram_file.download_to_drive(archive)
-            digest_match = re.search(r"sha256:([0-9a-f]{64})", reply.caption)
-            expected_digest = digest_match.group(1) if digest_match else None
-        user_match = re.search(r"user:(\d+)", reply.caption)
-        if not expected_digest or not user_match or int(user_match.group(1)) != update.effective_user.id:
-            raise ValueError("Backup metadata does not match")
-        count = restore_backup(context.application.bot_data["database"], config.data_dir, archive, update.effective_user.id, expected_digest)
-        await update.effective_message.reply_text(f"Restored {count} GIF(s).")
-    except (ValueError, OSError, KeyError, json.JSONDecodeError, zipfile.BadZipFile) as error:
-        logger.warning("Restore rejected: %s", error)
-        await update.effective_message.reply_text(f"Restore rejected: {error}")
-    finally:
-        archive.unlink(missing_ok=True)
+            part_path.unlink(missing_ok=True)
+
+
+def user_id_argument(context: ContextTypes.DEFAULT_TYPE) -> int | None:
+    if len(context.args) != 1:
+        return None
+    try:
+        return int(context.args[0])
+    except ValueError:
+        return None
+
+
+async def require_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    if not allowed(update, context):
+        await deny(update)
+        return False
+    if not is_admin(update.effective_user.id, context):
+        await update.effective_message.reply_text("Only bot admins can manage users.")
+        return False
+    return True
+
+
+async def allow_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not claim_message(update, context) or not await require_admin(update, context):
+        return
+    user_id = user_id_argument(context)
+    if user_id is None:
+        await update.effective_message.reply_text("Usage: /allow <Telegram user ID>")
+        return
+    if is_admin(user_id, context):
+        await update.effective_message.reply_text(f"User {user_id} is an admin and is always allowed.")
+        return
+    database: Database = context.application.bot_data["database"]
+    if database.add_allowed_user(user_id, update.effective_user.id):
+        await update.effective_message.reply_text(f"User {user_id} can now use the bot.")
+    else:
+        await update.effective_message.reply_text(f"User {user_id} is already allowed.")
+
+
+async def revoke_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not claim_message(update, context) or not await require_admin(update, context):
+        return
+    user_id = user_id_argument(context)
+    if user_id is None:
+        await update.effective_message.reply_text("Usage: /revoke <Telegram user ID>")
+        return
+    if is_admin(user_id, context):
+        await update.effective_message.reply_text(
+            f"User {user_id} is an admin. Remove them from ADMIN_USER_IDS to revoke their access."
+        )
+        return
+    database: Database = context.application.bot_data["database"]
+    if database.remove_allowed_user(user_id):
+        await update.effective_message.reply_text(f"User {user_id} can no longer use the bot. Their saved GIFs are kept.")
+    else:
+        await update.effective_message.reply_text(f"User {user_id} was not allowed.")
+
+
+async def list_users(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not claim_message(update, context) or not await require_admin(update, context):
+        return
+    config: Config = context.application.bot_data["config"]
+    admins = "\n".join(str(user_id) for user_id in sorted(config.admin_user_ids))
+    allowed_users = "\n".join(
+        f"{record['user_id']} (added by {record['added_by']} on {record['created_at']})"
+        for record in context.application.bot_data["database"].list_allowed_users()
+    ) or "none"
+    await update.effective_message.reply_text(f"Admins:\n{admins}\n\nAllowed users:\n{allowed_users}")
 
 
 async def button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -510,18 +674,20 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not claim_callback(update, context):
         return
     config: Config = context.application.bot_data["config"]
-    if not allowed(update, config):
+    if not allowed(update, context):
         await query.answer("Not allowlisted", show_alert=True)
         return
     await query.answer()
     if query.data == "save":
+        reset_modes(context)
         context.user_data["save_mode"] = "single"
         await query.message.reply_text("Send one GIF now. Use /cancel to stop.")
     elif query.data == "bulk_save":
+        reset_modes(context)
         context.user_data["save_mode"] = "bulk"
         await query.message.reply_text("Send GIFs now. I will keep saving them until /cancel or another command.")
     elif query.data == "pending:save":
-        pending = context.user_data.pop("pending_gif", None)
+        pending = context.user_data.get("pending_gifs", {}).pop(query.message.message_id, None)
         if not pending:
             await query.message.edit_caption(caption="This pending GIF has expired.")
             return
@@ -535,12 +701,15 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             pending_path.unlink(missing_ok=True)
             await query.message.edit_caption(caption="This GIF was already saved.")
             return
-        destination = pending_path.with_name(pending_path.name.removeprefix(".pending-"))
-        database.add_gif(user_id, pending["sha256"], str(destination.relative_to(config.data_dir)), pending["file_id"])
-        pending_path.rename(destination)
+        destination = pending_path.with_name(f"{pending['sha256']}.gif")
+        pending_path.replace(destination)
+        database.add_gif(
+            user_id, pending["sha256"], str(destination.relative_to(config.data_dir)),
+            pending["file_id"], pending["file_unique_id"],
+        )
         await query.message.edit_caption(caption="GIF saved.")
     elif query.data == "pending:discard":
-        pending = context.user_data.pop("pending_gif", None)
+        pending = context.user_data.get("pending_gifs", {}).pop(query.message.message_id, None)
         if pending:
             Path(pending["path"]).unlink(missing_ok=True)
         await query.message.edit_caption(caption="GIF discarded.")
@@ -591,7 +760,8 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     elif query.data == "list":
         await list_gifs(update, context)
     elif query.data == "backup":
-        await backup(update, context)
+        # Run in the background like the /backup command, so other updates are not held up.
+        context.application.create_task(backup(update, context), update=update)
     else:
         await query.message.reply_text("Random GIF browsing will be added next.")
 
@@ -613,11 +783,15 @@ def build_application(config: Config) -> Application:
     application.add_handler(CommandHandler("bulk_save", bulk_save_command))
     application.add_handler(CommandHandler("cancel", cancel))
     application.add_handler(CommandHandler("delete", delete_gif))
+    application.add_handler(CommandHandler("allow", allow_user))
+    application.add_handler(CommandHandler("revoke", revoke_user))
+    application.add_handler(CommandHandler("users", list_users))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, receive_tags))
     application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, receive_gif))
     application.add_handler(CommandHandler("list", list_gifs))
-    application.add_handler(CommandHandler("backup", backup))
-    application.add_handler(CommandHandler("restore", restore))
+    # Backup and restore can take minutes, so they run in the background instead of blocking other updates.
+    application.add_handler(CommandHandler("backup", backup, block=False))
+    application.add_handler(CommandHandler("restore", restore, block=False))
     application.add_handler(InlineQueryHandler(inline_gifs))
     application.add_handler(CallbackQueryHandler(button, pattern="^(save|bulk_save|list|backup|random|menu|browse:.*|edit_tags:.*|tag:.*|tags_done:.*|pending:(save|discard))$"))
     application.add_error_handler(error_handler)
@@ -627,6 +801,7 @@ def build_application(config: Config) -> Application:
 def main() -> None:
     config = Config.from_environment()
     config.data_dir.mkdir(parents=True, exist_ok=True)
+    remove_stale_temporary_files(config.data_dir)
     build_application(config).run_polling()
 
 

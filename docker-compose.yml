@@ -4,7 +4,7 @@ services:
     restart: unless-stopped
     environment:
       BOT_TOKEN: ${BOT_TOKEN}
-      ALLOWED_USER_IDS: ${ALLOWED_USER_IDS}
+      ADMIN_USER_IDS: ${ADMIN_USER_IDS:-${ALLOWED_USER_IDS}}
       DATA_DIR: /data
       MAX_FILE_SIZE: ${MAX_FILE_SIZE:-19922944}
       TZ: ${TZ:-Europe/Berlin}

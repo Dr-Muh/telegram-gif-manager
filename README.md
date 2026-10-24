@@ -26,6 +26,16 @@ Planned commands:
 - `/cancel` - cancel the current action
 - `/help` - show commands and open the main menu
 
+Admin commands:
+
+- `/allow <user ID>` - allow a Telegram user to use the bot
+- `/revoke <user ID>` - revoke a user's access; their saved GIFs are kept
+- `/users` - list admins and allowed users
+
+## Access control
+
+Admins are configured with `ADMIN_USER_IDS` (comma-separated Telegram user IDs) and can always use the bot. Other users are stored in the SQLite database and are managed by admins with `/allow` and `/revoke`. When a user who is not allowed writes to the bot, the reply shows their Telegram user ID so they can send it to an admin. The old `ALLOWED_USER_IDS` variable is still accepted as a fallback and is treated as the admin list.
+
 Planned inline-menu actions:
 
 - Save a GIF, add tags, and finish saving
@@ -53,7 +63,7 @@ The bot uses local storage inside the container for fast access:
 
 To survive loss of the Docker volume, `/backup` creates a compressed archive containing the current user's database records and media files. The bot sends that archive as a document directly into the same private chat with that user. No backup channel, group, or other Telegram destination is required. The user can reply to that document with `/restore` after a reinstall or data loss.
 
-The hosted Telegram Bot API limits bot document uploads to 50 MiB. The bot checks the generated archive before uploading and reports its size when the library is too large. The configured 2 GiB GIF limit applies to individual GIFs on local storage; it does not increase Telegram's document upload limit.
+The hosted Telegram Bot API limits bot document uploads to 50 MiB. The bot checks the generated archive before uploading and reports its size when the library is too large. Individual GIFs are limited by `MAX_FILE_SIZE` (default 20 MiB), because the hosted Bot API does not let bots download larger files.
 
 Backups larger than 19 MiB are split into numbered parts followed by a small manifest document. The 19 MiB part size supports both Telegram's bot upload and hosted `getFile` download limits. To restore one, reply to the manifest document with `/restore`; the bot downloads and verifies every part, reassembles the archive, and then restores the library.
 
@@ -80,20 +90,20 @@ The bot should validate backup archives before replacing local data and keep the
 
 ## Status
 
-Initial implementation is available. Copy `.env.example` to `.env`, set the bot token and one or more Telegram user IDs in `ALLOWED_USER_IDS`, then run `docker compose up --build`.
+Initial implementation is available. Copy `.env.example` to `.env`, set the bot token and one or more admin Telegram user IDs in `ADMIN_USER_IDS`, then run `docker compose up --build`.
 
 The bot currently implements the allowlist, help/menu, single-GIF saving, bulk saving until cancellation, exact deduplication, per-user local storage, manual `/backup`, reply-based `/restore`, and the inline GIF picker. Search, tagging, and random retrieval remain on the TODO list.
 
 ## Run without Docker
 
-Install the dependencies with `python -m pip install -r requirements.txt`, then set `BOT_TOKEN`, `ALLOWED_USER_IDS`, and optionally `DATA_DIR` in the process environment. From the repository root, either command works:
+Install the dependencies with `python -m pip install -r requirements.txt`, then set `BOT_TOKEN`, `ADMIN_USER_IDS`, and optionally `DATA_DIR` in the process environment. From the repository root, either command works:
 
 ```powershell
 python -m bot.main
 python bot/main.py
 ```
 
-Without Docker, data defaults to `./data` inside the project and can be changed with `DATA_DIR`. Docker overrides this setting and stores data in its persistent `/data` volume. The bot requires a valid token and at least one allowlisted Telegram user ID before it starts polling.
+Without Docker, data defaults to `./data` inside the project and can be changed with `DATA_DIR`. Docker overrides this setting and stores data in its persistent `/data` volume. The bot requires a valid token and at least one admin Telegram user ID before it starts polling.
 
 ## Build the image for Linux amd64 (telegram-gif-manager.tar already compiled)
 
