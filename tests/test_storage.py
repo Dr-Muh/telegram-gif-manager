@@ -7,7 +7,7 @@ import pytest
 
 from bot.backup import append_file, create_backup, restore_backup, sha256_file, split_archive
 from bot.database import Database
-from bot.main import TAGS_PER_PAGE, remove_stale_temporary_files, tag_menu
+from bot.main import TAGS_PER_PAGE, apply_typed_tags, remove_stale_temporary_files, tag_menu
 
 
 def make_database(tmp_path: Path) -> tuple[Database, Path]:
@@ -306,3 +306,10 @@ def test_tag_menu_pages_through_all_tags(tmp_path: Path) -> None:
     long_button = next(button for button in last_buttons if long_tag in button.text)
     assert long_button.callback_data == f"tag:{gif_id}:b:1:#{len(tags) - 1}"
     assert all(len(button.callback_data.encode()) <= 64 for button in last_buttons)
+
+
+def test_typed_tags_are_added_to_existing_tags() -> None:
+    assert apply_typed_tags(["dog", "funny"], "Cat, dog") == ["dog", "funny", "cat"]
+    assert apply_typed_tags(["dog", "funny"], "-funny, cat, - dog") == ["cat"]
+    assert apply_typed_tags(["dog"], "-cat") == ["dog"]
+    assert apply_typed_tags(["dog", "funny"], " - ") == []

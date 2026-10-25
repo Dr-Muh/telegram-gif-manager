@@ -124,7 +124,7 @@ def browse_menu(index: int, total: int, gif_id: int) -> InlineKeyboardMarkup:
 
 def browse_caption(index: int, total: int, record: object) -> str:
     tags = record["tags"] or "none"
-    return f"GIF {index + 1} / {total}\nTags: {tags}\nSHA-256: {record['sha256'][:12]}..."
+    return f"GIF {index + 1} / {total}\nTags: {tags}"
 
 
 def pending_gif_menu() -> InlineKeyboardMarkup:
@@ -210,7 +210,7 @@ def tag_menu(database: Database, user_id: int, gif_id: int, origin: str, view: s
     heading = "GIF saved." if origin == "n" else "Edit tags."
     caption = (
         f"{heading}\nTags: {', '.join(current_tags) or 'none'}\n\n"
-        "Tap a tag to add or remove it, or type a comma separated list of tags."
+        "Tap a tag to add or remove it, or type comma separated tags to add. Type -tag to remove a tag."
     )
     return caption, InlineKeyboardMarkup(rows)
 
@@ -378,6 +378,16 @@ async def receive_gif(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     return None
 
 
+def apply_typed_tags(current_tags: list[str], text: str) -> list[str]:
+    """Typed tags are added to the existing ones; "-tag" removes a tag and a single "-" removes all tags."""
+    typed_tags = parse_tags(text)
+    if typed_tags == ["-"]:
+        return []
+    removed_tags = set(parse_tags(tag[1:] for tag in typed_tags if tag.startswith("-")))
+    added_tags = [tag for tag in typed_tags if not tag.startswith("-")]
+    return [tag for tag in parse_tags(current_tags + added_tags) if tag not in removed_tags]
+
+
 async def receive_tags(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if "editing_gif_id" not in context.user_data:
         await receive_gif(update, context)
@@ -386,25 +396,32 @@ async def receive_tags(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
     if not allowed(update, context):
         return
-    tags = parse_tags(update.effective_message.text)
-    if tags == ["-"]:
-        tags = []
+    gif_id = context.user_data["editing_gif_id"]
+    database: Database = context.application.bot_data["database"]
+    tags = apply_typed_tags(database.get_tags(update.effective_user.id, gif_id), update.effective_message.text)
     if len(", ".join(tags)) > 500:
         await update.effective_message.reply_text("Those tags are too long. Please try again (maximum 500 characters).")
         return
-    gif_id = context.user_data["editing_gif_id"]
     origin = context.user_data.get("editing_origin", "b")
     editing_message = context.user_data.get("editing_message")
     stop_tag_editing(context)
-    database: Database = context.application.bot_data["database"]
     database.update_tags(update.effective_user.id, gif_id, tags)
+    # The edited GIF message shows the new tags, so the typed message is no longer needed.
+    # It is deleted first, so a failing edit below cannot leave it behind.
+    try:
+        await update.effective_message.delete()
+    except TelegramError as error:
+        logger.warning("Could not delete tag message for user %s: %s", update.effective_user.id, error)
     if origin == "n" and editing_message:
         chat_id, message_id = editing_message
-        await context.bot.edit_message_caption(
-            chat_id=chat_id, message_id=message_id,
-            caption=saved_caption(database.get_tags(update.effective_user.id, gif_id)), reply_markup=None,
-        )
-        await update.effective_message.reply_text("Tags saved.")
+        try:
+            await context.bot.edit_message_caption(
+                chat_id=chat_id, message_id=message_id,
+                caption=saved_caption(database.get_tags(update.effective_user.id, gif_id)), reply_markup=None,
+            )
+        except BadRequest as error:
+            if "not modified" not in str(error).lower():
+                raise
     else:
         await show_browsed_gif(update, context, gif_id)
 
