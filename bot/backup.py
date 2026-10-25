@@ -11,6 +11,9 @@ from .database import Database
 
 
 PREFIX = "telegram-gif-manager-backup"
+# Format 2 stores tags as a list; format 1 stored them as a comma separated string.
+ARCHIVE_FORMAT = 2
+SUPPORTED_ARCHIVE_FORMATS = {1, 2}
 
 
 def sha256_file(path: Path) -> str:
@@ -22,7 +25,7 @@ def sha256_file(path: Path) -> str:
 
 
 def create_backup(database: Database, data_dir: Path, user_id: int) -> tuple[Path, str]:
-    return write_backup_archive([dict(row) for row in database.list_gifs(user_id)], data_dir, user_id)
+    return write_backup_archive(database.export_user_data(user_id), data_dir, user_id)
 
 
 def write_backup_archive(records: list[dict[str, object]], data_dir: Path, user_id: int) -> tuple[Path, str]:
@@ -33,7 +36,7 @@ def write_backup_archive(records: list[dict[str, object]], data_dir: Path, user_
     try:
         with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zip_file:
             manifest = {
-                "format": 1,
+                "format": ARCHIVE_FORMAT,
                 "user_id": user_id,
                 "created_at": datetime.now(timezone.utc).isoformat(),
                 "records": records,
@@ -69,7 +72,7 @@ def extract_backup_archive(
                 raise ValueError("Invalid backup archive")
             zip_file.extractall(temporary_path)
         manifest = json.loads((temporary_path / "manifest.json").read_text(encoding="utf-8"))
-        if manifest.get("format") != 1 or manifest.get("user_id") != user_id:
+        if manifest.get("format") not in SUPPORTED_ARCHIVE_FORMATS or manifest.get("user_id") != user_id:
             raise ValueError("Backup belongs to another user or uses an unsupported format")
         records = manifest.get("records", [])
         if not isinstance(records, list):
@@ -82,6 +85,9 @@ def extract_backup_archive(
             source = temporary_path / "media" / relative_path.name
             if not source.is_file():
                 raise ValueError("Backup is missing media files")
+            tags = record.get("tags", "")
+            if not isinstance(tags, str) and not (isinstance(tags, list) and all(isinstance(tag, str) for tag in tags)):
+                raise ValueError("Backup contains invalid tags")
             normalized_record = dict(record)
             normalized_record["file_path"] = relative_path.as_posix()
             normalized_records.append(normalized_record)

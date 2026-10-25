@@ -25,12 +25,12 @@ from telegram.ext import (
 if __package__:
     from .backup import append_file, extract_backup_archive, sha256_file, split_archive, write_backup_archive
     from .config import Config
-    from .database import Database
+    from .database import Database, parse_tags
 else:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     from bot.backup import append_file, extract_backup_archive, sha256_file, split_archive, write_backup_archive
     from bot.config import Config
-    from bot.database import Database
+    from bot.database import Database, parse_tags
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -146,10 +146,10 @@ async def show_browsed_gif(
 
 
 def tag_menu(gif_id: int, current_tags: str, available_tags: list[str]) -> InlineKeyboardMarkup:
-    selected = {tag.strip().casefold() for tag in current_tags.split(",") if tag.strip()}
+    selected = set(parse_tags(current_tags))
     buttons = [
         InlineKeyboardButton(
-            f"{'[x]' if tag.casefold() in selected else '[ ]'} {tag}",
+            f"{'[x]' if tag in selected else '[ ]'} {tag}",
             callback_data=f"tag:{gif_id}:{index}",
         )
         for index, tag in enumerate(available_tags)
@@ -212,10 +212,7 @@ async def inline_gifs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not is_allowed(user.id, context):
         await update.inline_query.answer([], cache_time=0, is_personal=True)
         return
-    query = update.inline_query.query.strip().casefold()
-    records = context.application.bot_data["database"].list_gifs(user.id)
-    if query:
-        records = [record for record in records if query in record["tags"].casefold()]
+    records = context.application.bot_data["database"].search_gifs(user.id, update.inline_query.query)
     records = random.sample(records, k=min(len(records), MAX_INLINE_RESULTS))
     results = [
         InlineQueryResultCachedGif(
@@ -333,12 +330,10 @@ async def receive_tags(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
     if not allowed(update, context):
         return
-    tags = ", ".join(
-        tag.strip() for tag in update.effective_message.text.split(",") if tag.strip()
-    )
-    if tags == "-":
-        tags = ""
-    if len(tags) > 500:
+    tags = parse_tags(update.effective_message.text)
+    if tags == ["-"]:
+        tags = []
+    if len(", ".join(tags)) > 500:
         await update.effective_message.reply_text("Those tags are too long. Please try again (maximum 500 characters).")
         return
     gif_id = context.user_data.pop("editing_gif_id")
@@ -468,7 +463,7 @@ async def backup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     async with lock, chat_action(context, update.effective_chat.id, ChatAction.UPLOAD_DOCUMENT):
         status = await update.effective_message.reply_text("Backup started: creating the archive...")
-        records = [dict(row) for row in context.application.bot_data["database"].list_gifs(user_id)]
+        records = context.application.bot_data["database"].export_user_data(user_id)
         archive, digest = await asyncio.to_thread(write_backup_archive, records, config.data_dir, user_id)
         try:
             archive_size = archive.stat().st_size
@@ -791,14 +786,9 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not record:
             await query.message.edit_text("That GIF is no longer in your library.")
             return
-        tags = [tag.strip() for tag in record["tags"].split(",") if tag.strip()]
-        matching_tag = available_tags[tag_index]
-        if matching_tag.casefold() in {tag.casefold() for tag in tags}:
-            tags = [tag for tag in tags if tag.casefold() != matching_tag.casefold()]
-        else:
-            tags.append(matching_tag)
-        updated_tags = ", ".join(tags)
-        context.application.bot_data["database"].update_tags(update.effective_user.id, gif_id, updated_tags)
+        database = context.application.bot_data["database"]
+        database.toggle_tag(update.effective_user.id, gif_id, available_tags[tag_index])
+        updated_tags = ", ".join(database.get_tags(update.effective_user.id, gif_id))
         await query.edit_message_reply_markup(reply_markup=tag_menu(gif_id, updated_tags, available_tags))
     elif query.data.startswith("tags_done:"):
         gif_id = int(query.data.split(":", 1)[1])

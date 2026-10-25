@@ -128,3 +128,132 @@ def test_gif_counts_are_grouped_by_user(tmp_path: Path) -> None:
     database.add_gif(20, "a", "gifs/20/a.gif", "file-c")
 
     assert database.gif_counts() == {10: 2, 20: 1}
+
+
+def test_tags_are_normalized_and_deduplicated(tmp_path: Path) -> None:
+    database, _ = make_database(tmp_path)
+    gif_id = database.add_gif(10, "a", "gifs/10/a.gif", "file-a", tags=" Funny ,dog,  thumbs   UP, funny,")
+
+    assert database.get_tags(10, gif_id) == ["dog", "funny", "thumbs up"]
+    assert database.find_by_id(10, gif_id)["tags"] == "dog, funny, thumbs up"
+    database.toggle_tag(10, gif_id, "Dog")
+    database.toggle_tag(10, gif_id, "cat")
+    assert database.get_tags(10, gif_id) == ["cat", "funny", "thumbs up"]
+
+
+def test_tags_cannot_be_changed_on_another_users_gif(tmp_path: Path) -> None:
+    database, _ = make_database(tmp_path)
+    gif_id = database.add_gif(10, "a", "gifs/10/a.gif", "file-a", tags="dog")
+
+    database.update_tags(20, gif_id, "cat")
+
+    assert database.get_tags(10, gif_id) == ["dog"]
+
+
+def test_tag_counts_are_per_user(tmp_path: Path) -> None:
+    database, _ = make_database(tmp_path)
+    database.add_gif(10, "a", "gifs/10/a.gif", "file-a", tags="dog, funny")
+    database.add_gif(10, "b", "gifs/10/b.gif", "file-b", tags="dog")
+    database.add_gif(20, "a", "gifs/20/a.gif", "file-c", tags="cat")
+
+    assert database.tag_counts(10) == [("dog", 2), ("funny", 1)]
+    assert database.list_tags(20) == ["cat"]
+
+
+def test_search_matches_word_prefixes_of_all_terms(tmp_path: Path) -> None:
+    database, _ = make_database(tmp_path)
+    database.add_gif(10, "a", "gifs/10/a.gif", "file-a", tags="dog, thumbs up")
+    database.add_gif(10, "b", "gifs/10/b.gif", "file-b", tags="education")
+    database.add_gif(10, "c", "gifs/10/c.gif", "file-c", tags="dog, sad")
+    database.add_gif(20, "d", "gifs/20/d.gif", "file-d", tags="dog")
+
+    def search(query: str) -> list[str]:
+        return sorted(record["sha256"] for record in database.search_gifs(10, query))
+
+    assert search("") == ["a", "b", "c"]
+    assert search("DO") == ["a", "c"]
+    assert search("cat") == []
+    assert search("up") == ["a"]
+    assert search("dog sad") == ["c"]
+    assert search("%") == []
+
+
+def test_deleting_a_gif_removes_its_tags(tmp_path: Path) -> None:
+    database, _ = make_database(tmp_path)
+    gif_id = database.add_gif(10, "a", "gifs/10/a.gif", "file-a", tags="dog")
+
+    database.delete_gif(10, gif_id)
+
+    assert database.list_tags(10) == []
+
+
+def test_existing_tag_column_is_migrated_to_tag_table(tmp_path: Path) -> None:
+    path = tmp_path / "data" / "gifs.db"
+    path.parent.mkdir()
+    connection = sqlite3.connect(path)
+    connection.execute(
+        "CREATE TABLE gifs (id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, sha256 TEXT NOT NULL,"
+        " file_path TEXT NOT NULL, file_id TEXT NOT NULL, file_unique_id TEXT, tags TEXT NOT NULL DEFAULT '',"
+        " created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, UNIQUE(user_id, sha256))"
+    )
+    connection.execute("INSERT INTO gifs (user_id, sha256, file_path, file_id, tags) VALUES (10, 'a', 'gifs/10/a.gif', 'f', 'Dog, funny')")
+    connection.execute("INSERT INTO gifs (user_id, sha256, file_path, file_id) VALUES (10, 'b', 'gifs/10/b.gif', 'g')")
+    connection.commit()
+    connection.close()
+
+    database = Database(path)
+
+    columns = {row["name"] for row in database.connection.execute("PRAGMA table_info(gifs)")}
+    assert "tags" not in columns
+    assert database.find_by_hash(10, "a")["tags"] == "dog, funny"
+    assert database.find_by_hash(10, "b")["tags"] == ""
+    database.connection.close()
+    assert Database(path).list_tags(10) == ["dog", "funny"]
+
+
+def test_backup_round_trip_keeps_tags(tmp_path: Path) -> None:
+    database, data_dir = make_database(tmp_path)
+    user_dir = data_dir / "gifs" / "10"
+    user_dir.mkdir(parents=True)
+    (user_dir / "a.gif").write_bytes(b"gif-a")
+    (user_dir / "b.gif").write_bytes(b"gif-b")
+    database.add_gif(10, "a", "gifs/10/a.gif", "file-a", tags="dog, thumbs up")
+    database.add_gif(10, "b", "gifs/10/b.gif", "file-b")
+    archive, _ = create_backup(database, data_dir, 10)
+    with zipfile.ZipFile(archive) as zip_file:
+        manifest = json.loads(zip_file.read("manifest.json"))
+    database.connection.execute("DELETE FROM gifs")
+    database.connection.commit()
+
+    assert manifest["format"] == 2
+    assert {record["sha256"]: record["tags"] for record in manifest["records"]} == {"a": ["dog", "thumbs up"], "b": []}
+    assert restore_backup(database, data_dir, archive, 10) == 2
+    assert database.find_by_hash(10, "a")["tags"] == "dog, thumbs up"
+    assert database.find_by_hash(10, "b")["tags"] == ""
+    archive.unlink()
+
+
+def test_restore_reads_tags_from_format_1_backup(tmp_path: Path) -> None:
+    database, data_dir = make_database(tmp_path)
+    archive = tmp_path / "old.zip"
+    with zipfile.ZipFile(archive, "w") as zip_file:
+        zip_file.writestr("manifest.json", json.dumps({"format": 1, "user_id": 10, "records": [
+            {"sha256": "a", "file_path": "gifs/10/a.gif", "file_id": "file-a", "tags": "Dog, funny", "created_at": "2025-01-01 00:00:00"},
+        ]}))
+        zip_file.writestr("media/a.gif", b"gif-a")
+
+    assert restore_backup(database, data_dir, archive, 10) == 1
+    assert database.find_by_hash(10, "a")["tags"] == "dog, funny"
+
+
+def test_restore_rejects_invalid_tags(tmp_path: Path) -> None:
+    database, data_dir = make_database(tmp_path)
+    archive = tmp_path / "bad.zip"
+    with zipfile.ZipFile(archive, "w") as zip_file:
+        zip_file.writestr("manifest.json", json.dumps({"format": 2, "user_id": 10, "records": [
+            {"sha256": "a", "file_path": "gifs/10/a.gif", "file_id": "file-a", "tags": [1, 2]},
+        ]}))
+        zip_file.writestr("media/a.gif", b"gif-a")
+
+    with pytest.raises(ValueError, match="invalid tags"):
+        restore_backup(database, data_dir, archive, 10)

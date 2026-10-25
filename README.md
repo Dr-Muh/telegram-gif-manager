@@ -51,13 +51,13 @@ Planned inline-menu actions:
 
 Enable inline mode once in BotFather with `/setinline` for this bot. Users can then press **Use inline picker** in the menu or type `@your_bot` in any chat. The bot returns `InlineQueryResultCachedGif` results using the Telegram `file_id`s already stored for that user, so Telegram renders the results in its native inline grid and no media is downloaded again.
 
-Inline results are private to the requesting allowlisted user. An empty inline query shows that user's saved GIFs; typing a search term currently filters by saved tags. Inline mode does not expose another user's library.
+Inline results are private to the requesting allowlisted user. An empty inline query shows that user's saved GIFs; typing search terms filters by saved tags. Every term must match the start of a word in one of the GIF's tags, so `dog up` finds a GIF tagged `dog` and `thumbs up`. Inline mode does not expose another user's library.
 
 ## Persistence and recovery
 
 The bot uses local storage inside the container for fast access:
 
-- SQLite database for GIF metadata, hashes, tags, and backup state
+- SQLite database for GIF metadata, hashes, tags, and backup state. Tags are stored lowercase in their own `gif_tags` table; databases with the older comma-separated `tags` column are migrated automatically on startup
 - Local media directory for downloaded GIF files
 - Docker volume mounted at `/data`
 
