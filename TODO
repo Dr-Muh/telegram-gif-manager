@@ -27,7 +27,7 @@
 - [x] Ask before saving unsolicited GIFs and browse existing ones
 - [x] Add reply-based `/delete` for saved GIFs
 - [x] Add tag editing from the GIF browser
-- [ ] Add optional tags and categories during saving
+- [x] Add optional tags during saving, with suggested tags
 - [ ] Implement paginated browsing with inline buttons
 - [ ] Implement tag search and random GIF retrieval
 - [ ] Handle unsupported media and large files clearly

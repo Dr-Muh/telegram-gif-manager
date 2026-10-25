@@ -40,6 +40,9 @@ MAX_PROCESSED_CALLBACKS = 1000
 MAX_INLINE_RESULTS = 50
 MAX_PENDING_GIFS = 20
 BACKUP_PART_SIZE = 19 * 1024 * 1024
+TAG_SUGGESTIONS = 8
+TAGS_PER_PAGE = 20
+MAX_CALLBACK_DATA = 64
 
 
 def is_admin(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -64,7 +67,25 @@ async def deny(update: Update) -> None:
 
 def reset_modes(context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data.pop("save_mode", None)
-    context.user_data.pop("editing_gif_id", None)
+    stop_tag_editing(context)
+
+
+def stop_tag_editing(context: ContextTypes.DEFAULT_TYPE) -> None:
+    for key in ("editing_gif_id", "editing_origin", "editing_message"):
+        context.user_data.pop(key, None)
+
+
+def start_tag_editing(context: ContextTypes.DEFAULT_TYPE, gif_id: int, origin: str, message: Message) -> None:
+    """Makes the next text message set the tags of this GIF.
+
+    The origin is "b" when the tag menu was opened from the browser and "n" for a newly saved GIF.
+    """
+    context.user_data["editing_gif_id"] = gif_id
+    context.user_data["editing_origin"] = origin
+    context.user_data["editing_message"] = (message.chat_id, message.message_id)
+    if origin == "b":
+        context.user_data["browse_chat_id"] = message.chat_id
+        context.user_data["browse_message_id"] = message.message_id
 
 
 def remove_stale_temporary_files(data_dir: Path) -> None:
@@ -145,18 +166,53 @@ async def show_browsed_gif(
             context.user_data["browse_message_id"] = sent_message.message_id
 
 
-def tag_menu(gif_id: int, current_tags: str, available_tags: list[str]) -> InlineKeyboardMarkup:
-    selected = set(parse_tags(current_tags))
-    buttons = [
-        InlineKeyboardButton(
-            f"{'[x]' if tag in selected else '[ ]'} {tag}",
-            callback_data=f"tag:{gif_id}:{index}",
-        )
-        for index, tag in enumerate(available_tags)
-    ]
-    rows = [buttons[index:index + 2] for index in range(0, len(buttons), 2)]
-    rows.append([InlineKeyboardButton("Done", callback_data=f"tags_done:{gif_id}")])
-    return InlineKeyboardMarkup(rows)
+def saved_caption(tags: list[str]) -> str:
+    return f"GIF saved.\nTags: {', '.join(tags) or 'none'}"
+
+
+def tag_menu(database: Database, user_id: int, gif_id: int, origin: str, view: str) -> tuple[str, InlineKeyboardMarkup]:
+    """Builds the tag editor caption and keyboard.
+
+    The view is "s" for the GIF's tags plus suggestions, or a page number of all tags.
+    """
+    current_tags = database.get_tags(user_id, gif_id)
+    available_tags = database.list_tags(user_id)
+    rows = []
+    if view == "s":
+        shown_tags = current_tags + database.suggest_tags(user_id, gif_id, TAG_SUGGESTIONS)
+        if available_tags:
+            rows.append([InlineKeyboardButton(
+                f"Browse all tags ({len(available_tags)})", callback_data=f"tags_view:{gif_id}:{origin}:0"
+            )])
+    else:
+        page_count = max(1, (len(available_tags) + TAGS_PER_PAGE - 1) // TAGS_PER_PAGE)
+        page = min(max(int(view), 0), page_count - 1)
+        view = str(page)
+        shown_tags = available_tags[page * TAGS_PER_PAGE:(page + 1) * TAGS_PER_PAGE]
+        if page_count > 1:
+            rows.append([
+                InlineKeyboardButton("Previous", callback_data=f"tags_view:{gif_id}:{origin}:{(page - 1) % page_count}"),
+                InlineKeyboardButton(f"{page + 1} / {page_count}", callback_data="browse:noop"),
+                InlineKeyboardButton("Next", callback_data=f"tags_view:{gif_id}:{origin}:{(page + 1) % page_count}"),
+            ])
+        rows.append([InlineKeyboardButton("Suggestions", callback_data=f"tags_view:{gif_id}:{origin}:s")])
+
+    def tag_button(tag: str) -> InlineKeyboardButton:
+        # The tag itself is sent back when it fits, so the button still works after the tag list changes.
+        callback_data = f"tag:{gif_id}:{origin}:{view}:={tag}"
+        if len(callback_data.encode()) > MAX_CALLBACK_DATA:
+            callback_data = f"tag:{gif_id}:{origin}:{view}:#{available_tags.index(tag)}"
+        return InlineKeyboardButton(f"{'[x]' if tag in current_tags else '[ ]'} {tag}", callback_data=callback_data)
+
+    buttons = [tag_button(tag) for tag in shown_tags]
+    rows[:0] = [buttons[index:index + 2] for index in range(0, len(buttons), 2)]
+    rows.append([InlineKeyboardButton("Done", callback_data=f"tags_done:{gif_id}:{origin}")])
+    heading = "GIF saved." if origin == "n" else "Edit tags."
+    caption = (
+        f"{heading}\nTags: {', '.join(current_tags) or 'none'}\n\n"
+        "Tap a tag to add or remove it, or type a comma separated list of tags."
+    )
+    return caption, InlineKeyboardMarkup(rows)
 
 
 def claim_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -313,12 +369,12 @@ async def receive_gif(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return None
     destination = user_dir / f"{digest}.gif"
     temporary_path.replace(destination)
-    database.add_gif(user_id, digest, str(destination.relative_to(data_dir)), media.file_id, media.file_unique_id)
+    gif_id = database.add_gif(user_id, digest, str(destination.relative_to(data_dir)), media.file_id, media.file_unique_id)
     if save_mode == "single":
         context.user_data.pop("save_mode", None)
-        await message.reply_text("GIF saved.")
-    else:
-        await message.reply_text("GIF saved. Send another GIF or /cancel.")
+    caption, markup = tag_menu(database, user_id, gif_id, "n", "s")
+    sent_message = await message.reply_animation(media.file_id, caption=caption, reply_markup=markup)
+    start_tag_editing(context, gif_id, "n", sent_message)
     return None
 
 
@@ -336,9 +392,21 @@ async def receive_tags(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if len(", ".join(tags)) > 500:
         await update.effective_message.reply_text("Those tags are too long. Please try again (maximum 500 characters).")
         return
-    gif_id = context.user_data.pop("editing_gif_id")
-    context.application.bot_data["database"].update_tags(update.effective_user.id, gif_id, tags)
-    await show_browsed_gif(update, context, gif_id)
+    gif_id = context.user_data["editing_gif_id"]
+    origin = context.user_data.get("editing_origin", "b")
+    editing_message = context.user_data.get("editing_message")
+    stop_tag_editing(context)
+    database: Database = context.application.bot_data["database"]
+    database.update_tags(update.effective_user.id, gif_id, tags)
+    if origin == "n" and editing_message:
+        chat_id, message_id = editing_message
+        await context.bot.edit_message_caption(
+            chat_id=chat_id, message_id=message_id,
+            caption=saved_caption(database.get_tags(update.effective_user.id, gif_id)), reply_markup=None,
+        )
+        await update.effective_message.reply_text("Tags saved.")
+    else:
+        await show_browsed_gif(update, context, gif_id)
 
 
 async def delete_gif(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -750,50 +818,57 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             return
         destination = pending_path.with_name(f"{pending['sha256']}.gif")
         pending_path.replace(destination)
-        database.add_gif(
+        gif_id = database.add_gif(
             user_id, pending["sha256"], str(destination.relative_to(config.data_dir)),
             pending["file_id"], pending["file_unique_id"],
         )
-        await query.message.edit_caption(caption="GIF saved.")
+        caption, markup = tag_menu(database, user_id, gif_id, "n", "s")
+        await query.message.edit_caption(caption=caption, reply_markup=markup)
+        start_tag_editing(context, gif_id, "n", query.message)
     elif query.data == "pending:discard":
         pending = context.user_data.get("pending_gifs", {}).pop(query.message.message_id, None)
         if pending:
             Path(pending["path"]).unlink(missing_ok=True)
         await query.message.edit_caption(caption="GIF discarded.")
-    elif query.data.startswith("edit_tags:"):
-        gif_id = int(query.data.split(":", 1)[1])
-        record = context.application.bot_data["database"].find_by_id(update.effective_user.id, gif_id)
-        if not record:
-            await query.message.reply_text("That GIF is no longer in your library.")
+    elif query.data.startswith(("edit_tags:", "tags_view:", "tag:")):
+        user_id = update.effective_user.id
+        database: Database = context.application.bot_data["database"]
+        parts = query.data.split(":", 4)
+        if parts[0] == "edit_tags":
+            parts = ["tags_view", parts[1], "b", "s"]
+        elif parts[0] == "tag" and len(parts) == 3:
+            # Tag menus sent before suggestions were added only contain the tag index.
+            parts = ["tag", parts[1], "b", "s", f"#{parts[2]}"]
+        gif_id, origin, view = int(parts[1]), parts[2], parts[3]
+        if not database.find_by_id(user_id, gif_id):
+            await query.edit_message_caption(caption="That GIF is no longer in your library.")
             return
-        available_tags = context.application.bot_data["database"].list_tags(update.effective_user.id)
-        context.user_data["editing_gif_id"] = gif_id
-        context.user_data["browse_chat_id"] = query.message.chat_id
-        context.user_data["browse_message_id"] = query.message.message_id
-        await query.edit_message_caption(
-            caption="Choose tags to add or remove -- or type a comma separated list of tags:",
-            reply_markup=tag_menu(gif_id, record["tags"], available_tags),
-        )
-    elif query.data.startswith("tag:"):
-        _, gif_id_text, tag_index_text = query.data.split(":")
-        gif_id = int(gif_id_text)
-        available_tags = context.application.bot_data["database"].list_tags(update.effective_user.id)
-        tag_index = int(tag_index_text)
-        if tag_index >= len(available_tags):
-            await query.answer("That tag is no longer available.", show_alert=True)
-            return
-        record = context.application.bot_data["database"].find_by_id(update.effective_user.id, gif_id)
-        if not record:
-            await query.message.edit_text("That GIF is no longer in your library.")
-            return
-        database = context.application.bot_data["database"]
-        database.toggle_tag(update.effective_user.id, gif_id, available_tags[tag_index])
-        updated_tags = ", ".join(database.get_tags(update.effective_user.id, gif_id))
-        await query.edit_message_reply_markup(reply_markup=tag_menu(gif_id, updated_tags, available_tags))
+        if parts[0] == "tag":
+            reference = parts[4]
+            if reference.startswith("="):
+                tag = reference[1:]
+            else:
+                available_tags = database.list_tags(user_id)
+                tag_index = int(reference[1:])
+                if tag_index >= len(available_tags):
+                    await query.answer("That tag is no longer available.", show_alert=True)
+                    return
+                tag = available_tags[tag_index]
+            database.toggle_tag(user_id, gif_id, tag)
+        start_tag_editing(context, gif_id, origin, query.message)
+        caption, markup = tag_menu(database, user_id, gif_id, origin, view)
+        await query.edit_message_caption(caption=caption, reply_markup=markup)
     elif query.data.startswith("tags_done:"):
-        gif_id = int(query.data.split(":", 1)[1])
-        context.user_data.pop("editing_gif_id", None)
-        await show_browsed_gif(update, context, gif_id, edit=True)
+        parts = query.data.split(":")
+        gif_id = int(parts[1])
+        origin = parts[2] if len(parts) > 2 else "b"
+        if context.user_data.get("editing_gif_id") == gif_id:
+            stop_tag_editing(context)
+        if origin == "n":
+            tags = context.application.bot_data["database"].get_tags(update.effective_user.id, gif_id)
+            await query.edit_message_caption(caption=saved_caption(tags), reply_markup=None)
+        else:
+            await show_browsed_gif(update, context, gif_id, edit=True)
     elif query.data.startswith("browse:"):
         if query.data != "browse:noop":
             await browse_gif(update, context, int(query.data.split(":", 1)[1]))
@@ -835,7 +910,7 @@ def build_application(config: Config) -> Application:
     application.add_handler(CommandHandler("backup", backup, block=False))
     application.add_handler(CommandHandler("restore", restore, block=False))
     application.add_handler(InlineQueryHandler(inline_gifs))
-    application.add_handler(CallbackQueryHandler(button, pattern="^(save|bulk_save|list|backup|random|menu|browse:.*|edit_tags:.*|tag:.*|tags_done:.*|pending:(save|discard))$"))
+    application.add_handler(CallbackQueryHandler(button, pattern="^(save|bulk_save|list|backup|random|menu|browse:.*|edit_tags:.*|tag:.*|tags_view:.*|tags_done:.*|pending:(save|discard))$"))
     application.add_error_handler(error_handler)
     return application
 

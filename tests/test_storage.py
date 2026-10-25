@@ -7,7 +7,7 @@ import pytest
 
 from bot.backup import append_file, create_backup, restore_backup, sha256_file, split_archive
 from bot.database import Database
-from bot.main import remove_stale_temporary_files
+from bot.main import TAGS_PER_PAGE, remove_stale_temporary_files, tag_menu
 
 
 def make_database(tmp_path: Path) -> tuple[Database, Path]:
@@ -257,3 +257,52 @@ def test_restore_rejects_invalid_tags(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="invalid tags"):
         restore_backup(database, data_dir, archive, 10)
+
+
+def test_suggestions_prefer_tags_used_together(tmp_path: Path) -> None:
+    database, _ = make_database(tmp_path)
+    database.add_gif(10, "a", "gifs/10/a.gif", "file-a", tags="dog, funny")
+    database.add_gif(10, "b", "gifs/10/b.gif", "file-b", tags="dog, funny")
+    database.add_gif(10, "c", "gifs/10/c.gif", "file-c", tags="sad")
+    database.add_gif(10, "d", "gifs/10/d.gif", "file-d", tags="sad")
+    database.add_gif(10, "e", "gifs/10/e.gif", "file-e", tags="sad, cat")
+    database.add_gif(20, "f", "gifs/20/f.gif", "file-f", tags="dog, private")
+    new_id = database.add_gif(10, "g", "gifs/10/g.gif", "file-g")
+
+    assert database.suggest_tags(10, new_id, 3) == ["sad", "dog", "funny"]
+    database.update_tags(10, new_id, "dog")
+    assert database.suggest_tags(10, new_id, 3) == ["funny", "sad", "cat"]
+
+
+def test_tag_menu_shows_current_tags_and_suggestions(tmp_path: Path) -> None:
+    database, _ = make_database(tmp_path)
+    database.add_gif(10, "a", "gifs/10/a.gif", "file-a", tags="dog, funny")
+    gif_id = database.add_gif(10, "b", "gifs/10/b.gif", "file-b", tags="dog")
+
+    caption, markup = tag_menu(database, 10, gif_id, "n", "s")
+    buttons = [button for row in markup.inline_keyboard for button in row]
+
+    assert caption.startswith("GIF saved.\nTags: dog")
+    assert [button.text for button in buttons] == ["[x] dog", "[ ] funny", "Browse all tags (2)", "Done"]
+    assert buttons[1].callback_data == f"tag:{gif_id}:n:s:=funny"
+    assert buttons[3].callback_data == f"tags_done:{gif_id}:n"
+
+
+def test_tag_menu_pages_through_all_tags(tmp_path: Path) -> None:
+    database, _ = make_database(tmp_path)
+    long_tag = "x" * 60
+    tags = [f"tag {index:02}" for index in range(TAGS_PER_PAGE + 4)] + [long_tag]
+    gif_id = database.add_gif(10, "a", "gifs/10/a.gif", "file-a", tags=tags)
+
+    _, first_page = tag_menu(database, 10, gif_id, "b", "0")
+    _, last_page = tag_menu(database, 10, gif_id, "b", "99")
+    first_texts = [button.text for row in first_page.inline_keyboard for button in row]
+    last_buttons = [button for row in last_page.inline_keyboard for button in row]
+
+    assert first_texts[:2] == ["[x] tag 00", "[x] tag 01"]
+    assert len([text for text in first_texts if text.startswith("[x]")]) == TAGS_PER_PAGE
+    assert "1 / 2" in first_texts and "Suggestions" in first_texts
+    assert "2 / 2" in [button.text for button in last_buttons]
+    long_button = next(button for button in last_buttons if long_tag in button.text)
+    assert long_button.callback_data == f"tag:{gif_id}:b:1:#{len(tags) - 1}"
+    assert all(len(button.callback_data.encode()) <= 64 for button in last_buttons)

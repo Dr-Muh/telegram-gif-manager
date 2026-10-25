@@ -172,6 +172,25 @@ class Database:
             (user_id,),
         )]
 
+    def suggest_tags(self, user_id: int, gif_id: int, limit: int) -> list[str]:
+        """Suggests tags the GIF does not have yet.
+
+        Tags that often appear together with the GIF's current tags come first, then the most used tags.
+        """
+        current_tags = set(self.get_tags(user_id, gif_id))
+        together = {row["tag"]: row["count"] for row in self.connection.execute(
+            "SELECT other.tag, COUNT(*) AS count FROM gif_tags AS mine"
+            " JOIN gifs ON gifs.id = mine.gif_id"
+            " JOIN gif_tags AS other ON other.gif_id = mine.gif_id"
+            " WHERE gifs.user_id = ? AND mine.gif_id != ?"
+            " AND mine.tag IN (SELECT tag FROM gif_tags WHERE gif_id = ?)"
+            " GROUP BY other.tag",
+            (user_id, gif_id, gif_id),
+        )}
+        candidates = [(tag, count) for tag, count in self.tag_counts(user_id) if tag not in current_tags]
+        candidates.sort(key=lambda candidate: (-together.get(candidate[0], 0), -candidate[1], candidate[0]))
+        return [tag for tag, _ in candidates[:limit]]
+
     def export_user_data(self, user_id: int) -> list[dict[str, object]]:
         """Returns the user's GIF records with tags as a list, as stored in backups."""
         records = []
