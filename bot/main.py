@@ -16,7 +16,7 @@ from telegram import (
     InputMediaAnimation, Message, Update,
 )
 from telegram.constants import ChatAction
-from telegram.error import BadRequest, TelegramError, TimedOut
+from telegram.error import BadRequest, NetworkError, TelegramError, TimedOut
 from telegram.ext import (
     Application, CallbackQueryHandler, CommandHandler, ContextTypes,
     InlineQueryHandler, MessageHandler, filters,
@@ -43,6 +43,7 @@ BACKUP_PART_SIZE = 19 * 1024 * 1024
 TAG_SUGGESTIONS = 8
 TAGS_PER_PAGE = 20
 MAX_CALLBACK_DATA = 64
+JUMP_STEPS = (-10, -5, 5, 10)
 
 
 def is_admin(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -67,6 +68,7 @@ async def deny(update: Update) -> None:
 
 def reset_modes(context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data.pop("save_mode", None)
+    context.user_data.pop("jump_message", None)
     stop_tag_editing(context)
 
 
@@ -80,6 +82,7 @@ def start_tag_editing(context: ContextTypes.DEFAULT_TYPE, gif_id: int, origin: s
 
     The origin is "b" when the tag menu was opened from the browser and "n" for a newly saved GIF.
     """
+    context.user_data.pop("jump_message", None)
     context.user_data["editing_gif_id"] = gif_id
     context.user_data["editing_origin"] = origin
     context.user_data["editing_message"] = (message.chat_id, message.message_id)
@@ -95,7 +98,18 @@ def remove_stale_temporary_files(data_dir: Path) -> None:
             path.unlink(missing_ok=True)
 
 
+def is_transient_polling_error(update: object, error: BaseException | None) -> bool:
+    """Network errors while fetching updates (update is None) are retried by the library and need no traceback.
+
+    BadRequest is a NetworkError subclass, but it means a wrong request, so it is still logged in full.
+    """
+    return update is None and isinstance(error, NetworkError) and not isinstance(error, BadRequest)
+
+
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if is_transient_polling_error(update, context.error):
+        logger.warning("Telegram network error while polling, retrying: %s", context.error)
+        return
     logger.error("Unhandled update error", exc_info=context.error)
 
 
@@ -114,12 +128,44 @@ def browse_menu(index: int, total: int, gif_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("Previous", callback_data=f"browse:{previous_index}"),
-            InlineKeyboardButton(f"{index + 1} / {total}", callback_data="browse:noop"),
+            InlineKeyboardButton(f"{index + 1} / {total}", callback_data=f"browse:jump:{index}"),
             InlineKeyboardButton("Next", callback_data=f"browse:{next_index}"),
         ],
         [InlineKeyboardButton("Edit tags", callback_data=f"edit_tags:{gif_id}")],
         [InlineKeyboardButton("Back to menu", callback_data="menu")],
     ])
+
+
+def jump_targets(index: int, total: int) -> tuple[list[tuple[str, int]], list[int]]:
+    """Returns the relative steps as (label, target) and the absolute targets of the jump menu.
+
+    Relative steps wrap around like Previous and Next; absolute targets are the first, last and quarter positions.
+    """
+    steps = [(f"{step:+d}", (index + step) % total) for step in JUMP_STEPS if abs(step) < total]
+    marks = sorted({round(fraction * (total - 1)) for fraction in (0, 0.25, 0.5, 0.75, 1)} - {index})
+    return steps, marks
+
+
+def jump_menu(index: int, total: int) -> InlineKeyboardMarkup:
+    steps, marks = jump_targets(index, total)
+    rows = []
+    if steps:
+        rows.append([InlineKeyboardButton(label, callback_data=f"browse:{target}") for label, target in steps])
+    if marks:
+        rows.append([InlineKeyboardButton(str(target + 1), callback_data=f"browse:{target}") for target in marks])
+    rows.append([
+        InlineKeyboardButton("Type a number", callback_data=f"browse:type:{index}"),
+        InlineKeyboardButton("Back", callback_data=f"browse:back:{index}"),
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
+def parse_gif_number(text: str, total: int) -> int | None:
+    """Turns a typed GIF number (1 based) into an index, or None when it is not a valid position."""
+    text = text.strip()
+    if not text.isdigit() or not 1 <= int(text) <= total:
+        return None
+    return int(text) - 1
 
 
 def browse_caption(index: int, total: int, record: object) -> str:
@@ -388,7 +434,30 @@ def apply_typed_tags(current_tags: list[str], text: str) -> list[str]:
     return [tag for tag in parse_tags(current_tags + added_tags) if tag not in removed_tags]
 
 
+async def receive_jump_number(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not claim_update(update, context):
+        return
+    if not allowed(update, context):
+        return
+    user_id = update.effective_user.id
+    total = len(context.application.bot_data["database"].list_gifs(user_id))
+    index = parse_gif_number(update.effective_message.text, total)
+    if index is None:
+        await update.effective_message.reply_text(f"Please type a GIF number from 1 to {total}, or use /cancel.")
+        return
+    chat_id, message_id = context.user_data.pop("jump_message")
+    # The browse message shows the chosen GIF, so the typed number is no longer needed.
+    try:
+        await update.effective_message.delete()
+    except TelegramError as error:
+        logger.warning("Could not delete jump message for user %s: %s", user_id, error)
+    await browse_gif(update, context, index, chat_id=chat_id, message_id=message_id)
+
+
 async def receive_tags(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if "jump_message" in context.user_data:
+        await receive_jump_number(update, context)
+        return
     if "editing_gif_id" not in context.user_data:
         await receive_gif(update, context)
         return
@@ -488,21 +557,37 @@ async def list_gifs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         context.user_data["browse_message_id"] = sent_message.message_id
 
 
-async def browse_gif(update: Update, context: ContextTypes.DEFAULT_TYPE, index: int) -> None:
-    query = update.callback_query
+async def browse_gif(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, index: int,
+    chat_id: int | None = None, message_id: int | None = None,
+) -> None:
+    """Shows the GIF at this index in the browse message.
+
+    That is the message of the pressed button, unless chat_id and message_id name another one.
+    """
+    if chat_id is None:
+        chat_id, message_id = update.callback_query.message.chat_id, update.callback_query.message.message_id
     records = context.application.bot_data["database"].list_gifs(update.effective_user.id)
     if not records:
-        await query.edit_message_text("You have no saved GIFs yet.", reply_markup=menu())
+        await context.bot.edit_message_caption(
+            chat_id=chat_id, message_id=message_id, caption="You have no saved GIFs yet.", reply_markup=None,
+        )
         return
     index %= len(records)
     record = records[index]
-    await query.edit_message_media(
-        media=InputMediaAnimation(
-            media=record["file_id"],
-            caption=browse_caption(index, len(records), record),
-        ),
-        reply_markup=browse_menu(index, len(records), record["id"]),
-    )
+    try:
+        await context.bot.edit_message_media(
+            chat_id=chat_id, message_id=message_id,
+            media=InputMediaAnimation(
+                media=record["file_id"],
+                caption=browse_caption(index, len(records), record),
+            ),
+            reply_markup=browse_menu(index, len(records), record["id"]),
+        )
+    except BadRequest as error:
+        # Jumping to the GIF that is already shown changes nothing.
+        if "not modified" not in str(error).lower():
+            raise
 
 
 def user_lock(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> asyncio.Lock:
@@ -887,8 +972,42 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         else:
             await show_browsed_gif(update, context, gif_id, edit=True)
     elif query.data.startswith("browse:"):
-        if query.data != "browse:noop":
-            await browse_gif(update, context, int(query.data.split(":", 1)[1]))
+        parts = query.data.split(":")
+        if parts[1] == "noop":
+            return
+        # Any browse button ends a pending "Type a number", so a later text message is not taken as a jump.
+        context.user_data.pop("jump_message", None)
+        if parts[1] in ("jump", "back", "type"):
+            # These only change the keyboard and caption, which is faster than replacing the GIF.
+            records = context.application.bot_data["database"].list_gifs(update.effective_user.id)
+            total = len(records)
+            if not total:
+                await browse_gif(update, context, 0)
+                return
+            index = min(int(parts[2]), total - 1)
+            if parts[1] == "jump":
+                await query.edit_message_reply_markup(reply_markup=jump_menu(index, total))
+            elif parts[1] == "back":
+                shown = query.message.animation
+                if not shown or shown.file_unique_id != records[index]["file_unique_id"]:
+                    # The library changed since the menu was opened, so the GIF itself has to be replaced.
+                    await browse_gif(update, context, index)
+                    return
+                await query.edit_message_caption(
+                    caption=browse_caption(index, total, records[index]),
+                    reply_markup=browse_menu(index, total, records[index]["id"]),
+                )
+            else:
+                stop_tag_editing(context)
+                context.user_data["jump_message"] = (query.message.chat_id, query.message.message_id)
+                await query.edit_message_caption(
+                    caption=f"{query.message.caption}\n\nType a GIF number from 1 to {total}.",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("Back", callback_data=f"browse:back:{index}"),
+                    ]]),
+                )
+        else:
+            await browse_gif(update, context, int(parts[1]))
     elif query.data == "menu":
         await query.message.reply_text("Choose an action:", reply_markup=menu())
     elif query.data == "list":

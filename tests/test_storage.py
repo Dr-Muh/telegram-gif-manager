@@ -4,10 +4,14 @@ import sqlite3
 import zipfile
 
 import pytest
+from telegram.error import BadRequest, NetworkError, TimedOut
 
 from bot.backup import append_file, create_backup, restore_backup, sha256_file, split_archive
 from bot.database import Database
-from bot.main import TAGS_PER_PAGE, apply_typed_tags, remove_stale_temporary_files, tag_menu
+from bot.main import (
+    TAGS_PER_PAGE, apply_typed_tags, is_transient_polling_error, jump_targets, parse_gif_number,
+    remove_stale_temporary_files, tag_menu,
+)
 
 
 def make_database(tmp_path: Path) -> tuple[Database, Path]:
@@ -313,3 +317,29 @@ def test_typed_tags_are_added_to_existing_tags() -> None:
     assert apply_typed_tags(["dog", "funny"], "-funny, cat, - dog") == ["cat"]
     assert apply_typed_tags(["dog"], "-cat") == ["dog"]
     assert apply_typed_tags(["dog", "funny"], " - ") == []
+
+
+def test_jump_targets_wrap_steps_and_skip_current_position() -> None:
+    steps, marks = jump_targets(2, 40)
+    assert steps == [("-10", 32), ("-5", 37), ("+5", 7), ("+10", 12)]
+    assert marks == [0, 10, 20, 29, 39]
+    steps, marks = jump_targets(0, 4)
+    assert [label for label, _ in steps] == []
+    assert marks == [1, 2, 3]
+    assert jump_targets(0, 1) == ([], [])
+
+
+def test_parse_gif_number_accepts_only_positions_in_range() -> None:
+    assert parse_gif_number(" 7 ", 10) == 6
+    assert parse_gif_number("1", 10) == 0
+    assert parse_gif_number("10", 10) == 9
+    for text in ("0", "11", "-1", "abc", "", "2.5"):
+        assert parse_gif_number(text, 10) is None
+
+
+def test_only_polling_network_errors_are_treated_as_transient() -> None:
+    assert is_transient_polling_error(None, NetworkError("Bad Gateway"))
+    assert is_transient_polling_error(None, TimedOut())
+    assert not is_transient_polling_error(None, BadRequest("Chat not found"))
+    assert not is_transient_polling_error(None, ValueError("bug"))
+    assert not is_transient_polling_error(object(), NetworkError("Bad Gateway"))
