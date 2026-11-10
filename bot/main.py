@@ -212,8 +212,81 @@ async def show_browsed_gif(
             context.user_data["browse_message_id"] = sent_message.message_id
 
 
-def saved_caption(tags: list[str]) -> str:
-    return f"GIF saved.\nTags: {', '.join(tags) or 'none'}"
+async def jump_to_existing_gif(update: Update, context: ContextTypes.DEFAULT_TYPE, gif_id: int) -> None:
+    """Shows an already saved GIF in a new browser message at the bottom of the chat.
+
+    The GIF the user sent and the previous browser message are deleted, so the chat keeps one browser.
+    """
+    user_id = update.effective_user.id
+    message = update.effective_message
+    old_browser = (context.user_data.pop("browse_chat_id", None), context.user_data.pop("browse_message_id", None))
+    try:
+        await message.delete()
+    except TelegramError as error:
+        logger.warning("Could not delete sent GIF for user %s: %s", user_id, error)
+    if old_browser[1]:
+        # A pending tag edit or number jump on the old browser would otherwise point to a deleted message.
+        if context.user_data.get("editing_message") == old_browser:
+            stop_tag_editing(context)
+        if context.user_data.get("jump_message") == old_browser:
+            context.user_data.pop("jump_message", None)
+        try:
+            await context.bot.delete_message(*old_browser)
+        except TelegramError as error:
+            logger.warning("Could not delete old browser message for user %s: %s", user_id, error)
+    records = context.application.bot_data["database"].list_gifs(user_id)
+    index = next(index for index, record in enumerate(records) if record["id"] == gif_id)
+    record = records[index]
+    sent_message = await context.bot.send_animation(
+        message.chat_id, record["file_id"],
+        caption=browse_caption(index, len(records), record),
+        reply_markup=browse_menu(index, len(records), gif_id),
+    )
+    context.user_data["browse_chat_id"] = sent_message.chat_id
+    context.user_data["browse_message_id"] = sent_message.message_id
+
+
+def remember_source_message(context: ContextTypes.DEFAULT_TYPE, tag_message: Message, source: tuple[int, int]) -> None:
+    """Remembers the GIF message the user sent for this tag menu, so it can be deleted once tagging is done."""
+    source_messages = context.user_data.setdefault("source_messages", {})
+    source_messages[tag_message.message_id] = source
+    while len(source_messages) > MAX_PENDING_GIFS:
+        source_messages.pop(next(iter(source_messages)))
+
+
+async def show_saved_gif_in_browser(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, gif_id: int, chat_id: int, message_id: int
+) -> None:
+    """Turns the tag menu of a newly saved GIF into the browser at that GIF.
+
+    The GIF the user sent is deleted, since the browser message now shows it.
+    """
+    user_id = update.effective_user.id
+    source = context.user_data.get("source_messages", {}).pop(message_id, None)
+    if source:
+        try:
+            await context.bot.delete_message(*source)
+        except TelegramError as error:
+            logger.warning("Could not delete sent GIF for user %s: %s", user_id, error)
+    records = context.application.bot_data["database"].list_gifs(user_id)
+    index = next((index for index, record in enumerate(records) if record["id"] == gif_id), None)
+    if index is None:
+        await context.bot.edit_message_caption(
+            chat_id=chat_id, message_id=message_id, caption="That GIF is no longer in your library.", reply_markup=None,
+        )
+        return
+    try:
+        # The tag menu already shows this GIF, so only the caption and keyboard change.
+        await context.bot.edit_message_caption(
+            chat_id=chat_id, message_id=message_id,
+            caption=browse_caption(index, len(records), records[index]),
+            reply_markup=browse_menu(index, len(records), gif_id),
+        )
+    except BadRequest as error:
+        if "not modified" not in str(error).lower():
+            raise
+    context.user_data["browse_chat_id"] = chat_id
+    context.user_data["browse_message_id"] = message_id
 
 
 def tag_menu(database: Database, user_id: int, gif_id: int, origin: str, view: str) -> tuple[str, InlineKeyboardMarkup]:
@@ -387,12 +460,9 @@ async def receive_gif(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         temporary_path.unlink(missing_ok=True)
         if not existing["file_unique_id"]:
             database.set_file_unique_id(user_id, existing["id"], media.file_unique_id)
-        if not save_mode:
-            await show_browsed_gif(update, context, existing["id"])
-            return None
         if save_mode == "single":
             context.user_data.pop("save_mode", None)
-        await message.reply_animation(existing["file_id"], caption="Already saved: this GIF is a duplicate.")
+        await jump_to_existing_gif(update, context, existing["id"])
         return None
     if not save_mode:
         pending_path = user_dir / f".pending-{message.message_id}-{digest}.gif"
@@ -408,6 +478,7 @@ async def receive_gif(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             "sha256": digest,
             "file_id": media.file_id,
             "file_unique_id": media.file_unique_id,
+            "source_message": (message.chat_id, message.message_id),
         }
         while len(pending_gifs) > MAX_PENDING_GIFS:
             expired = pending_gifs.pop(next(iter(pending_gifs)))
@@ -421,6 +492,7 @@ async def receive_gif(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     caption, markup = tag_menu(database, user_id, gif_id, "n", "s")
     sent_message = await message.reply_animation(media.file_id, caption=caption, reply_markup=markup)
     start_tag_editing(context, gif_id, "n", sent_message)
+    remember_source_message(context, sent_message, (message.chat_id, message.message_id))
     return None
 
 
@@ -482,15 +554,7 @@ async def receive_tags(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     except TelegramError as error:
         logger.warning("Could not delete tag message for user %s: %s", update.effective_user.id, error)
     if origin == "n" and editing_message:
-        chat_id, message_id = editing_message
-        try:
-            await context.bot.edit_message_caption(
-                chat_id=chat_id, message_id=message_id,
-                caption=saved_caption(database.get_tags(update.effective_user.id, gif_id)), reply_markup=None,
-            )
-        except BadRequest as error:
-            if "not modified" not in str(error).lower():
-                raise
+        await show_saved_gif_in_browser(update, context, gif_id, *editing_message)
     else:
         await show_browsed_gif(update, context, gif_id)
 
@@ -927,6 +991,8 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         caption, markup = tag_menu(database, user_id, gif_id, "n", "s")
         await query.message.edit_caption(caption=caption, reply_markup=markup)
         start_tag_editing(context, gif_id, "n", query.message)
+        if pending.get("source_message"):
+            remember_source_message(context, query.message, pending["source_message"])
     elif query.data == "pending:discard":
         pending = context.user_data.get("pending_gifs", {}).pop(query.message.message_id, None)
         if pending:
@@ -967,8 +1033,7 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if context.user_data.get("editing_gif_id") == gif_id:
             stop_tag_editing(context)
         if origin == "n":
-            tags = context.application.bot_data["database"].get_tags(update.effective_user.id, gif_id)
-            await query.edit_message_caption(caption=saved_caption(tags), reply_markup=None)
+            await show_saved_gif_in_browser(update, context, gif_id, query.message.chat_id, query.message.message_id)
         else:
             await show_browsed_gif(update, context, gif_id, edit=True)
     elif query.data.startswith("browse:"):
